@@ -20,6 +20,23 @@ and without an astrophysicist on the team, which is exactly why the Confidence L
 the blind TOI benchmark) are published in [exonit-results](https://github.com/marc252/exonit-results), under the
 same L0 disclaimer.
 
+## Revision log (development version, not yet in this snapshot)
+
+What has changed in the development version since this snapshot. It will reach this repository with the next release, after the corrected false-positive model has been validated.
+
+**2026-10-18**
+- **False-positive probability (FPP) model reworked**, reviewed:
+  - fixes to the noise model and the exposure-time integration;
+  - eccentric and very short-period orbits: a physical Roche limit and a robust Kepler solver;
+  - light-curve dilution: SPOC PDCSAP and TGLC fluxes are already corrected for neighbouring stars, and the old model subtracted that light a second time;
+  - new photometric geometry (product-specific apertures, sector-averaged positions, smooth flux ratios), validated once on a fresh pre-registered sample;
+  - background stars from a per-star Galaxia population, cross-checked against Gaia DR3 counts. This population is being computed now (about 7 million stars).
+- **Period aliases.** Detections at a multiple or fraction of the true period are recognised in post-processing. The pipeline-side part is being A/B tested.
+- **Systematics veto.** Rejecting recurring spurious periods as a whole is implemented and is being tested in parallel before it is switched on.
+- **Data gaps.** Gap filling that does not distort the noise estimate is implemented, behind a switch, pending an A/B test.
+- **Classifier inputs.** A saturated CNN score is no longer mistaken for a real 0.0, and the ingest-time verdict now reads the stored CNN score.
+- **TGLC depths.** TGLC transit depths are about 9 % too deep (normalisation offset), which inflates planet radii by about 4 %. A correction has been added.
+
 ## How it works
 
 For every star the worker runs:
