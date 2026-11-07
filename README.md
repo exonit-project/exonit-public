@@ -1,6 +1,6 @@
 > **November 2026.** The corrected false-positive model (v3) is now in production, and recomputation of old values has started. The GPU versions match the CPU reference on 100 unseen stars (Apple Metal and NVIDIA CUDA). In our test sample, no known false positive was accepted, while the previous model accepted 4 of 5. Known limits: transit period and duration estimates are still being improved, some confirmed planets are wrongly rejected, and about 40 % of stars cannot be computed yet. Results remain Confidence Level L0. Contributions remain paused.
 >
-> The published [exonit-results](https://github.com/marc252/exonit-results) tables still hold values from the previous model until they are refreshed.
+> The published [exonit-results](https://github.com/exonit-project/exonit-results) tables now show false-positive values only from the corrected model; every other row reads `pending recompute` until it has been recomputed.
 
 # ExoNit
 
@@ -19,7 +19,7 @@ on its own GPU and reports the result. The project was built with substantial AI
 and without an astrophysicist on the team, which is exactly why the Confidence Ledger exists.
 
 **Results:** the raw outputs of every processed lot (per-lot scorecards, vetting dossiers, strong candidates and
-the blind TOI benchmark) are published in [exonit-results](https://github.com/marc252/exonit-results), under the
+the blind TOI benchmark) are published in [exonit-results](https://github.com/exonit-project/exonit-results), under the
 same L0 disclaimer.
 
 ## Revision log

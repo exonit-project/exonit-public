@@ -1,5 +1,8 @@
 # Changelog
 
+## sync 2026-11-07 (internal 5332c63)
+- (no user-facing changes)
+
 ## sync 2026-11-07 (internal 18959ec)
 - feat(alias): per-candidate harmonic_epoch_class provenance column, config-null/strict-bool hardening, wiring tests
 - feat(alias): server dispatches harmonic_epoch_class to workers (EXONIT_HARMONIC_EPOCH_CLASS)
