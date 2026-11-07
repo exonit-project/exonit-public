@@ -11,7 +11,7 @@ This module is ADDITIVE and safe to deploy dark: with no ``EXONIT_S3_ENDPOINT``
 back to the historical local-disk path. Turning it on is a pure env-var change.
 
 Config (environment):
-  EXONIT_S3_ENDPOINT     MinIO endpoint, e.g. http://minio-host:9000.
+  EXONIT_S3_ENDPOINT     MinIO endpoint, e.g. http://<postgres-host>:9000.
                          Empty/unset with keys present → real AWS S3.
   EXONIT_S3_FITS_BUCKET  bucket for TGLC FITS (default: exonit-fits).
   EXONIT_S3_ACCESS_KEY   access key (MinIO root or a scoped service account).
@@ -287,3 +287,24 @@ def store() -> Optional[ObjectStore]:
             if _store is None:
                 _store = ObjectStore()
     return _store
+
+
+# Dedicated client for header-only range reads on the serving path (FPP task geometry): short timeouts and no retry
+# chain, so a stalled MinIO holds a pool thread for seconds, not minutes.  The shared ``store()`` keeps its settings.
+HEADER_CONNECT_TIMEOUT_S = 2
+HEADER_READ_TIMEOUT_S = 3
+
+_header_store: Optional[ObjectStore] = None
+
+
+def header_store() -> Optional[ObjectStore]:
+    """ObjectStore for header reads: connect 2 s, read 3 s, one attempt.  None when object storage is disabled."""
+    global _header_store
+    if not is_enabled():
+        return None
+    if _header_store is None:
+        with _store_lock:
+            if _header_store is None:
+                _header_store = ObjectStore(connect_timeout=HEADER_CONNECT_TIMEOUT_S,
+                                            read_timeout=HEADER_READ_TIMEOUT_S, retries_max_attempts=1)
+    return _header_store

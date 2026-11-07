@@ -10,7 +10,7 @@ The ``completeness`` / ``completeness_agg`` subsystem (+ its 3 triggers) always
 stays on SQLite — even in PG mode — on a dedicated ``sqlite3`` connection
 (``self._cmpl_conn``), because the raw completeness table is huge and isolated.
 
-Phase 4a (2026-07-05, ``EXONIT_COMPLETENESS_PG=1``): that sidecar is being
+Fase 4a (2026-07-05, ``EXONIT_COMPLETENESS_PG=1``): that sidecar is being
 retired in favour of a PG staging + per-bucket-aggregate write path (see
 docs/superpowers/plans/2026-07-05-phase4-completeness-parquet.md). With the
 flag ON *and* the main backend on PostgreSQL, ``self._cmpl_conn`` is never
@@ -30,6 +30,46 @@ from exonit.completeness_store import completeness_pg_enabled
 from exonit.db_backend import is_pg_url, make_backend, select_in_chunks
 
 logger = logging.getLogger(__name__)
+
+#: model columns stored as JSONB on PostgreSQL (need an explicit CAST of the bound text)
+_JSON_MODEL_COLUMNS = ("fpp_scen", "mc_detail", "fpp_switches")
+
+#: step-7 Monte-Carlo columns: when the DDL is not applied yet the result is stored without them (dropped silently by _model_set); log that once per process
+_EPHEM_MODEL_COLUMNS = ("ephem_status", "ephem_reason", "ephem_period_days", "ephem_t0", "ephem_shift_h",
+                        "ephem_delta_chi2")
+_MC_MODEL_COLUMNS = ("nfpp_mc_se", "fpp_n_draws_total", "mc_min_ess", "mc_borderline", "mc_detail")
+_mc_column_warned = False
+_ephem_column_warned = False
+_switches_column_warned = False
+_hec_column_warned = False
+
+
+def _warn_mc_column_missing(col):
+    global _mc_column_warned
+    if not _mc_column_warned:
+        _mc_column_warned = True
+        logger.warning("FPP result carried step-7 MC field %s but the column is missing from candidates "
+                       "(DDL scripts/migration/2026-10-24_fpp_mc_columns.sql not applied): stored without "
+                       "the MC fields (warned once per process)", col)
+
+
+def _warn_ephem_column_missing(col):
+    global _ephem_column_warned
+    if not _ephem_column_warned:
+        _ephem_column_warned = True
+        logger.warning("FPP result carried ephemeris field %s but the column is missing from candidates "
+                       "(DDL scripts/migration/2026-10-30_fpp_ephem_columns.sql not applied): stored without "
+                       "the ephemeris fields (warned once per process)", col)
+
+
+def _warn_switches_column_missing():
+    global _switches_column_warned
+    if not _switches_column_warned:
+        _switches_column_warned = True
+        logger.warning("FPP result carried fpp_switches but the column is missing from candidates "
+                       "(DDL scripts/migration/2026-10-31_fpp_switches_verdict_v1.sql not applied): stored "
+                       "without the switch set (warned once per process)")
+
 
 # Sentinel: "caller did not pass verdict_proba" (distinct from an explicit None).
 _UNSET = object()
@@ -67,8 +107,8 @@ def derive_exominer_status(score, has_spoc=None):
     ``(exominer_score, stars.has_spoc)`` pair.
 
     Single source of truth for the Python-side write points in this module
-    (docs/superpowers/specs/exominer-status-column.md — "Step 2: separate
-    status from score"). ``scripts/migrate_exominer_status.py`` mirrors
+    (docs/superpowers/specs/exominer-status-column.md — "Pas 2: separar
+    l'estat de la puntuació"). ``scripts/migrate_exominer_status.py`` mirrors
     this exact rule in SQL for the bulk backfill (server-side, for
     performance at 13M+ rows) — see that script's ``_STATUS_CASE_SQL`` and
     the cross-check test that keeps the two in lockstep.
@@ -117,7 +157,7 @@ def _is_unique_violation(exc) -> bool:
     return False
 
 
-# PG error codes a concurrent "CREATE ... IF NOT EXISTS" race can raise (Phase
+# PG error codes a concurrent "CREATE ... IF NOT EXISTS" race can raise (Fase
 # 4a Task 4 follow-up e — see _ensure_completeness_pg_schema below).
 _CONCURRENT_DDL_RACE_SQLSTATES = frozenset({
     "42P07",  # duplicate_table
@@ -190,13 +230,13 @@ class ExoNitDB:
         self.backend = make_backend(db_path)
         self.dialect = self.backend.dialect
         self._is_pg = self.dialect.name == "postgres"
-        # Phase 4a cutover flag: only meaningful combined with a PG main
+        # Fase 4a cutover flag: only meaningful combined with a PG main
         # backend — completeness-on-PG with a SQLite main backend has no
         # defined behaviour (the flag exists to retire the PG-mode sidecar).
         self._cmpl_pg = self._is_pg and completeness_pg_enabled()
 
         if self._cmpl_pg:
-            # Phase 4a, flag ON: completeness moves to PG staging + per-bucket
+            # Fase 4a, flag ON: completeness moves to PG staging + per-bucket
             # aggregate tables under self.backend. No SQLite sidecar at all —
             # self._cmpl_conn/_cmpl_lock stay None/unused, self.conn is None
             # (nothing in the current codebase reaches into db.conn on the PG
@@ -254,7 +294,7 @@ class ExoNitDB:
 
     def _create_tables(self):
         # Completeness schema (+ triggers/backfill) lives on SQLite — even in
-        # PG mode, on the dedicated self._cmpl_conn — UNLESS the Phase 4a flag
+        # PG mode, on the dedicated self._cmpl_conn — UNLESS the Fase 4a flag
         # is on, in which case __init__ already called
         # _ensure_completeness_pg_schema() and there is no SQLite side at all.
         if not self._cmpl_pg:
@@ -547,7 +587,7 @@ class ExoNitDB:
             # (NULL = enqueued outside a --run-id-aware path, e.g. a manual
             # enqueue_from_csv.py without --run-id — adoptable by S4, out of
             # scope for any run). Replaces discovery_run_tics as the run's
-            # TIC-scope source, without dropping that table (operator
+            # TIC-scope source, without dropping that table (the owner's
             # decision §9.2: drop only after >=2 lots with
             # EXONIT_RUN_SCOPE=tasks + EXONIT_RUN_TICS_WRITE=0 and an export).
             try:
@@ -638,6 +678,21 @@ class ExoNitDB:
                     "ALTER TABLE candidates ADD COLUMN verdict_proba REAL")
             except sqlite3.OperationalError:
                 pass
+
+            # Migrate: fixed-FPP-model columns (plan step 6, exonit/fpp_model.py
+            # MODEL_COLUMNS): fpp_model_version, triceratops_fpp_v1/_nfpp_v1,
+            # fpp_scen, fpp_backend, ... ADDITIVE and nullable, no default. On
+            # PostgreSQL they are added by the DB owner
+            # (scripts/migration/2026-10-17_fpp_model_columns.sql), never here;
+            # every write path checks column_exists() so the server may run
+            # before that DDL (legacy behaviour, new fields dropped).
+            from exonit.fpp_model import MODEL_COLUMNS as _FPP_MODEL_COLS
+            for _col, (_pg_t, _sqlite_t) in _FPP_MODEL_COLS.items():
+                try:
+                    self.conn.execute(
+                        f"ALTER TABLE candidates ADD COLUMN {_col} {_sqlite_t}")
+                except sqlite3.OperationalError:
+                    pass
 
             # Migrate: cross-source photometric confirmation (Codex #3)
             for col, spec in [
@@ -737,6 +792,23 @@ class ExoNitDB:
                 "WHERE triceratops_nfpp IS NULL AND triceratops_fpp >= 0 "
                 "AND triceratops_fpp < 0.5 AND snr >= 10.0 "
                 "AND (cnn_score >= 0.7 OR exominer_ffi_score >= 0.5)",
+                # idx_cand_fpp_todo_n / idx_cand_nfpp_todo_n (plan step 6): the
+                # same two queue indexes with the cnn-NULL arm
+                # (``OR cnn_score IS NULL``), used by the queries only under
+                # EXONIT_FPP_CNN_NULL=1 (exonit.fpp_model.cnn_null_fpp_enabled).
+                # Native workers never run FPP in-task, and a sparse-view FFI
+                # candidate has cnn NULL / em_ffi 0.0, so without this arm it
+                # never reaches the backfill. The predicate text is the literal
+                # the queries carry (index matching).
+                "CREATE INDEX IF NOT EXISTS idx_cand_fpp_todo_n "
+                "ON candidates(snr DESC) "
+                "WHERE triceratops_fpp IS NULL AND snr >= 10.0 "
+                "AND (cnn_score >= 0.7 OR exominer_ffi_score >= 0.5 OR cnn_score IS NULL)",
+                "CREATE INDEX IF NOT EXISTS idx_cand_nfpp_todo_n "
+                "ON candidates(snr DESC) "
+                "WHERE triceratops_nfpp IS NULL AND triceratops_fpp >= 0 "
+                "AND triceratops_fpp < 0.5 AND snr >= 10.0 "
+                "AND (cnn_score >= 0.7 OR exominer_ffi_score >= 0.5 OR cnn_score IS NULL)",
                 # idx_cand_exominer_todo: Docker-SPOC ExoMiner backfill
                 # (has_spoc=1 path, EXONIT_ENABLE_EXOMINER_AUTO=0 in prod as
                 # of 2026-07-11) — deliberately UNCHANGED. It is outside the
@@ -941,7 +1013,7 @@ class ExoNitDB:
                         src_count, _time.monotonic() - _t0)
             conn.commit()
 
-    # --- Phase 4a: completeness-on-PG schema (EXONIT_COMPLETENESS_PG=1) --- #
+    # --- Fase 4a: completeness-on-PG schema (EXONIT_COMPLETENESS_PG=1) --- #
 
     def _ensure_completeness_pg_schema(self):
         """Create the PG completeness_staging / completeness_tics /
@@ -949,7 +1021,7 @@ class ExoNitDB:
         EXISTS``), mirroring the DDL hand-authored in
         ``scripts/migration/schema_pg.sql``.
 
-        Called from ``__init__`` only when the Phase 4a cutover flag
+        Called from ``__init__`` only when the Fase 4a cutover flag
         (``EXONIT_COMPLETENESS_PG=1``) is on and the main backend is
         PostgreSQL. In-code creation (rather than relying solely on the SQL
         file being applied out of band) means a fresh PG database — e.g. the
@@ -1272,8 +1344,185 @@ class ExoNitDB:
                 (min_snr,))
         return self._query(f"SELECT * FROM candidates ORDER BY {order}")
 
+    def fpp_model_ready(self, model_version=None):
+        """True when the fixed-model columns exist (DDL applied). A new-model result
+        (``fpp_model_version >= 2``) is only ever stored when this is True.
+
+        With ``model_version >= 3`` (FFI geometry v3) the geometry / dilution / population
+        provenance columns (``exonit.fpp_model.GEOMETRY_COLUMNS``) must exist as well: a model-3
+        number without the convention that produced it would be unattributable, so it is
+        refused instead of stored with the provenance dropped."""
+        from exonit.db_backend import column_exists
+        from exonit.fpp_model import FPP_MODEL_VERSION_GEOMETRY, GEOMETRY_COLUMNS
+        needed = ["fpp_model_version", "triceratops_fpp_v1", "triceratops_nfpp_v1"]
+        if model_version is not None and model_version >= FPP_MODEL_VERSION_GEOMETRY:
+            needed += list(GEOMETRY_COLUMNS)
+        return all(column_exists(self.backend, "candidates", c) for c in needed)
+
+    def _model_set(self, model_fields, legacy=None):
+        """``(set_sql, params)`` for the new-model columns of *model_fields* (validated by
+        ``exonit.fpp_model.extract_model_fields``), restricted to columns that exist.
+        When the row is being moved to the new model the legacy FPP/NFPP are preserved
+        in ``triceratops_fpp_v1`` / ``_nfpp_v1`` in the SAME statement (the RHS of an
+        UPDATE sees the old row), and only the first time (``COALESCE``), so a re-run
+        never overwrites the preserved legacy value with a new-model one. Returns
+        ``("", [])`` when nothing applies (no fields, or the DDL is not applied yet).
+
+        ``legacy`` = ``(fpp, nfpp)`` read BEFORE the row was rewritten (primary-result
+        path, where ``add_candidate`` has already overwritten ``triceratops_fpp``): the
+        values to preserve, instead of the SQL expression over the current row."""
+        if not model_fields:
+            return "", []
+        from exonit.db_backend import column_exists
+        from exonit.fpp_model import FPP_MODEL_VERSION_NEW, FppModelSchemaMissing
+        if (model_fields.get("fpp_model_version", 0) >= FPP_MODEL_VERSION_NEW
+                and not self.fpp_model_ready(model_fields.get("fpp_model_version"))):
+            # Never write a new-model FPP into the legacy columns: the row would look like a
+            # legacy value with no version, invisible to the verdict gate and unrecoverable.
+            raise FppModelSchemaMissing(
+                "fixed-FPP-model columns are not in the database (DDL not applied): "
+                "refusing a new-model FPP result")
+        sets, params = [], []
+        for col, val in model_fields.items():
+            if not column_exists(self.backend, "candidates", col):
+                if col in _MC_MODEL_COLUMNS:
+                    _warn_mc_column_missing(col)
+                elif col in _EPHEM_MODEL_COLUMNS:
+                    _warn_ephem_column_missing(col)
+                elif col == "fpp_switches":
+                    _warn_switches_column_missing()
+                continue
+            ph = "CAST(? AS JSONB)" if (col in _JSON_MODEL_COLUMNS and self._is_pg) else "?"
+            sets.append(f"{col} = {ph}")
+            params.append(val)
+        has_verdict_v1 = column_exists(self.backend, "candidates", "triceratops_verdict_v1")
+        if (model_fields.get("fpp_model_version", 0) >= FPP_MODEL_VERSION_NEW
+                and column_exists(self.backend, "candidates", "triceratops_fpp_v1")
+                and column_exists(self.backend, "candidates", "triceratops_nfpp_v1")):
+            if legacy is not None:
+                sets.append("triceratops_fpp_v1 = COALESCE(triceratops_fpp_v1, ?)")
+                sets.append("triceratops_nfpp_v1 = COALESCE(triceratops_nfpp_v1, ?)")
+                params.extend([legacy[0], legacy[1]])
+                if has_verdict_v1:
+                    # same derivation update_candidate_fpp uses for the verdict it stores
+                    sets.append("triceratops_verdict_v1 = COALESCE(triceratops_verdict_v1, ?)")
+                    params.append(fpp_verdict(legacy[0], legacy[1]) if legacy[0] is not None else None)
+            else:
+                old = "(fpp_model_version IS NULL OR fpp_model_version < %d)" % FPP_MODEL_VERSION_NEW
+                sets.append(f"triceratops_fpp_v1 = COALESCE(triceratops_fpp_v1, "
+                            f"CASE WHEN {old} THEN triceratops_fpp END)")
+                sets.append(f"triceratops_nfpp_v1 = COALESCE(triceratops_nfpp_v1, "
+                            f"CASE WHEN {old} THEN triceratops_nfpp END)")
+                if has_verdict_v1:
+                    # rehearsal P2: the verdict is overwritten by the same UPDATE (the RHS sees the old row)
+                    sets.append(f"triceratops_verdict_v1 = COALESCE(triceratops_verdict_v1, "
+                                f"CASE WHEN {old} AND triceratops_fpp IS NOT NULL THEN triceratops_verdict END)")
+        return ", ".join(sets), params
+
+    def set_candidate_harmonic_epoch_class(self, candidate_id, flag):
+        """Record whether the worker ran the alias phase-2 flag ``harmonic_epoch_class`` for this
+        candidate's scan (strict bool; NULL stays for old workers that do not report it). Tolerates
+        the DDL scripts/migration/2026-11-02_harmonic_epoch_class.sql not being applied (warns once).
+        Returns True when a write was issued."""
+        global _hec_column_warned
+        if not isinstance(flag, bool):
+            return False
+        from exonit.db_backend import column_exists
+        if not column_exists(self.backend, "candidates", "harmonic_epoch_class"):
+            if not _hec_column_warned:
+                _hec_column_warned = True
+                logger.warning("result carried harmonic_epoch_class but the column is missing from candidates "
+                               "(DDL scripts/migration/2026-11-02_harmonic_epoch_class.sql not applied): "
+                               "stored without it (warned once per process)")
+            return False
+        self.backend.execute(
+            "UPDATE candidates SET harmonic_epoch_class = ? WHERE id = ?",
+            (flag if self._is_pg else int(flag), candidate_id))
+        return True
+
+    def set_fpp_model_fields(self, candidate_id, model_fields, legacy=None):
+        """Store the new-model fields of an in-task FPP (primary result path), after
+        ``add_candidate``. *legacy* = ``peek_fpp()`` row taken before ``add_candidate``
+        (its FPP/NFPP are preserved in ``_v1`` only if it was a legacy-model row).
+        Returns True when a write was issued."""
+        keep = None
+        if legacy is not None and legacy["triceratops_fpp"] is not None:
+            mv = legacy["fpp_model_version"]
+            if mv is None or int(mv) < 2:
+                keep = (legacy["triceratops_fpp"], legacy["triceratops_nfpp"])
+        if legacy is not None and keep is None:
+            # no legacy value to preserve (fresh row, or already new model): never run the
+            # SQL expression, which would copy the NEW values over the current row
+            keep = (None, None)
+        set_sql, params = self._model_set(model_fields, legacy=keep)
+        if not set_sql:
+            return False
+        self.backend.execute(
+            f"UPDATE candidates SET {set_sql} WHERE id = ?", tuple(params) + (candidate_id,))
+        return True
+
+    def peek_fpp(self, tic_id, candidate_num, sector=None):
+        """The stored FPP/NFPP/model version of a candidate row BEFORE a rewrite (so the
+        primary path can keep the legacy value), or None. Tolerates a missing model column."""
+        from exonit.db_backend import column_exists
+        mv = "fpp_model_version" if column_exists(self.backend, "candidates", "fpp_model_version") else "NULL AS fpp_model_version"
+        sql = (f"SELECT triceratops_fpp, triceratops_nfpp, {mv} FROM candidates "
+               "WHERE tic_id = ? AND candidate_num = ?")
+        params = [str(tic_id), candidate_num]
+        if sector is not None:
+            sql += " AND sector = ?"
+            params.append(int(sector))
+        return self.backend.query_one(sql + " ORDER BY id ASC LIMIT 1", tuple(params))
+
+    def fpp_gate_select(self, alias="c"):
+        """Extra SELECT columns (leading comma, or "") that let the verdict gate
+        (``exonit.fpp_model.gate_candidate_for_verdict``) see which FPP model a row carries;
+        empty when the DDL is not applied (then there is only the legacy model)."""
+        from exonit.db_backend import column_exists
+        cols = [c for c in ("fpp_model_version", "triceratops_fpp_v1", "triceratops_nfpp_v1")
+                if column_exists(self.backend, "candidates", c)]
+        return "".join(f", {alias}.{c}" for c in cols)
+
+    def with_fpp_gate_inputs(self, candidate_id, candidate):
+        """*candidate* (dict from a worker body) plus the stored model version and legacy
+        FPP/NFPP of its row, so the verdict gate can act on it."""
+        sel = self.fpp_gate_select("candidates")
+        if not sel:
+            return candidate
+        row = self.backend.query_one(f"SELECT id{sel} FROM candidates WHERE id = ?", (candidate_id,))
+        if row is None:
+            return candidate
+        out = dict(candidate)
+        for k in ("fpp_model_version", "triceratops_fpp_v1", "triceratops_nfpp_v1"):
+            if k in row.keys():
+                out[k] = row[k]
+        return out
+
+    def with_stored_candidate(self, candidate_id, candidate):
+        """*candidate* (dict from a worker body) merged with its STORED row's classifier
+        inputs (``cnn_score`` + ``verdict_io.CANDIDATE_FIELDS`` + the FPP-model gate columns),
+        so the verdict classifier sees what was persisted, not the raw body.
+
+        The primary result body keeps cnn in a separate ``cnn_scores`` array, so its
+        candidate dict has no ``cnn_score`` key and the classifier would otherwise read
+        cnn = 0 (IR pilot finding 6). Unlike :meth:`with_fpp_gate_inputs`, this is called
+        for every stored row (legacy included) because the cnn fix applies to all of them."""
+        from exonit.verdict_io import CANDIDATE_FIELDS, GATE_FIELDS
+        cols = ["tic_id", "candidate_num"] + list(CANDIDATE_FIELDS)
+        sel = self.fpp_gate_select("candidates")
+        row = self.backend.query_one(
+            "SELECT " + ", ".join(f"candidates.{c}" for c in cols) + sel
+            + " FROM candidates WHERE candidates.id = ?", (candidate_id,))
+        if row is None:
+            return candidate
+        out = dict(candidate)
+        for k in cols + list(GATE_FIELDS):
+            if k in row.keys():
+                out[k] = row[k]
+        return out
+
     def update_candidate_fpp(self, candidate_id, fpp, nfpp=None,
-                             prob_planet=None, verdict=None):
+                             prob_planet=None, verdict=None, model_fields=None):
         """Update TRICERATOPS FPP/NFPP for a candidate.
 
         A failed NFPP backfill must not erase a previous valid FPP. In that
@@ -1281,10 +1530,16 @@ class ExoNitDB:
         loop forever and the candidate cannot be validated from FPP alone.
 
         After the write, best-effort re-enqueues the candidate on the "fpp"
-        work stream (Phase 1, Task 2) if arm B (nfpp still pending, see
+        work stream (Fase 1, Task 2) if arm B (nfpp still pending, see
         exonit.work_producers) applies to the just-written values — if the
         candidate is fully done, the hook is simply a no-op. A hook failure
         must never break the write above, hence the outer try/except.
+
+        ``model_fields`` (plan step 6): the validated new-model fields
+        (``exonit.fpp_model.extract_model_fields``); written in the same UPDATE, with
+        the legacy FPP/NFPP preserved in ``_v1`` (see ``_model_set``). A failed NFPP
+        backfill (fpp < 0 over an existing valid FPP) writes NO model fields: the
+        stored FPP is still the old model's, so the row must not be relabelled.
         """
         try:
             fpp_value = float(fpp) if fpp is not None else None
@@ -1292,6 +1547,8 @@ class ExoNitDB:
             fpp_value = None
 
         final_fpp = fpp_value
+        # computed BEFORE the transaction: column_exists() queries on its own connection
+        _m_sql, _m_params = self._model_set(model_fields)
         with self.backend.transaction() as conn:
             # Widened vs. the original triceratops_fpp-only SELECT to also
             # carry snr/cnn_score/exominer_ffi_score/tic_id for the producer
@@ -1322,9 +1579,10 @@ class ExoNitDB:
                     """UPDATE candidates SET triceratops_fpp = ?,
                               triceratops_nfpp = ?,
                               triceratops_prob_planet = ?,
-                              triceratops_verdict = ?
+                              triceratops_verdict = ?"""
+                    + (", " + _m_sql if _m_sql else "") + """
                        WHERE id = ?""",
-                    (fpp, nfpp, prob_planet, verdict, candidate_id))
+                    (fpp, nfpp, prob_planet, verdict, *_m_params, candidate_id))
 
         if row is not None:
             try:
@@ -1488,7 +1746,7 @@ class ExoNitDB:
 
         has_spoc: 1 = has 2-min SPOC; 0 = FFI-only confirmed; None clears it.
 
-        ExoMiner producer hook (Phase 1, Task 4): a has_spoc=1 write is
+        ExoMiner producer hook (Fase 1, Task 4): a has_spoc=1 write is
         exactly the transition the legacy ``worker_exominer_task`` queue
         predicate keys off (``s.has_spoc = 1``), so after persisting it we
         best-effort re-enqueue this TIC's currently queue-eligible
@@ -1573,6 +1831,23 @@ class ExoNitDB:
             (verdict, reason, candidate_id))
         return rowcount > 0
 
+    def set_fpp_skip_reason(self, candidate_id: int, reason: str) -> bool:
+        """Record why a candidate's FPP is the -1 sentinel (worker-reported, e.g.
+        'stellar_params_missing'). Only touches a row that really holds -1, so a
+        real FPP is never labelled; never overwrites an existing reason."""
+        return self.backend.execute_rowcount(
+            """UPDATE candidates SET fpp_skip_reason = ?
+               WHERE id = ? AND triceratops_fpp = -1
+                 AND fpp_skip_reason IS NULL""",
+            (str(reason)[:64], candidate_id)) > 0
+
+    def count_fpp_skip_reasons(self) -> dict:
+        """{fpp_skip_reason: n} over candidates whose FPP is the -1 sentinel."""
+        rows = self.backend.query(
+            """SELECT COALESCE(fpp_skip_reason, 'unspecified') AS reason, COUNT(*) AS n
+               FROM candidates WHERE triceratops_fpp = -1 GROUP BY 1""")
+        return {r["reason"]: r["n"] for r in rows}
+
     def mark_fpp_stellar_companion_for_tic(self, tic_id,
                                            max_depth_ppm: float) -> int:
         """Batch-mark this TIC's queue-eligible candidates whose transit is too
@@ -1610,7 +1885,7 @@ class ExoNitDB:
                  AND snr >= 10.0""",
             (verdict, str(tic_id), float(max_depth_ppm)))
 
-    def mark_fpp_uncomputable_for_tic(self, tic_id) -> int:
+    def mark_fpp_uncomputable_for_tic(self, tic_id, reason: str = "no_stellar_mass") -> int:
         """Batch-mark all FPP-queue-eligible candidates for a TIC as uncomputable.
 
         Eager FPP-gate companion to mark_fpp_uncomputable (which operates on a
@@ -1638,12 +1913,12 @@ class ExoNitDB:
                SET triceratops_fpp = -1,
                    triceratops_nfpp = -1,
                    triceratops_verdict = ?,
-                   fpp_skip_reason = 'no_stellar_mass'
+                   fpp_skip_reason = ?
                WHERE tic_id = ?
                  AND triceratops_fpp IS NULL
                  AND (cnn_score >= 0.7 OR exominer_ffi_score >= 0.5)
                  AND snr >= 10.0""",
-            (verdict, str(tic_id)))
+            (verdict, reason, str(tic_id)))
 
     def mark_ffi_only_candidates(self, tic_id):
         """Mark cnn>=0.7 candidates for an FFI-only TIC with exominer_score=-1.
@@ -2040,7 +2315,7 @@ class ExoNitDB:
     def add_completeness(self, tic_id, radius_earth, period_days, detection_prob):
         """Insert (flag OFF: upsert) a single completeness cell.
 
-        Flag ON (Phase 4a): delegates to ``add_completeness_many``'s PG
+        Flag ON (Fase 4a): delegates to ``add_completeness_many``'s PG
         staging append (as a one-cell list) — ``scripts/
         injection_probe_driver.py`` is the one production caller of this
         singular form, and it must not crash under
@@ -2069,7 +2344,7 @@ class ExoNitDB:
         single commit instead of ~72 — the dominant source of WAL churn /
         write-lock contention per worker result during a run.
 
-        Flag ON (``EXONIT_COMPLETENESS_PG=1``, Phase 4a): pure append into PG
+        Flag ON (``EXONIT_COMPLETENESS_PG=1``, Fase 4a): pure append into PG
         ``completeness_staging`` — no ON CONFLICT/upsert; the same
         (tic_id, radius_earth, period_days) key can appear more than once
         across calls, and last-write-wins dedup is the compaction job's job
@@ -2102,7 +2377,7 @@ class ExoNitDB:
         would, in PG mode, hit the empty PG ``completeness_agg`` table instead
         of the real SQLite aggregate — hence this explicit method.
 
-        Flag ON (Phase 4a): reads the PG ``completeness_agg_bucket`` table,
+        Flag ON (Fase 4a): reads the PG ``completeness_agg_bucket`` table,
         summed across buckets per (radius, period) cell — the per-bucket
         split is a write-side sharding detail invisible to readers.
 
@@ -2136,7 +2411,7 @@ class ExoNitDB:
             return [dict(r) for r in cur.fetchall()]
 
     def count_completeness_tics(self):
-        """Exact count of distinct TICs with completeness data (Phase 4a, for
+        """Exact count of distinct TICs with completeness data (Fase 4a, for
         the scorecard's ``distinct_completeness_tics`` — wired in Task 4).
 
         Flag ON: combines the compacted ``completeness_tics`` index with any
@@ -2145,7 +2420,7 @@ class ExoNitDB:
         mid-compaction (Task 3 owns compaction, not db.py).
 
         Flag OFF: the legacy SQLite ``completeness`` table (same concept,
-        pre-Phase-4a shape) — kept symmetric so a caller (e.g. the scorecard)
+        pre-Fase-4a shape) — kept symmetric so a caller (e.g. the scorecard)
         can call this unconditionally regardless of the flag.
         """
         if self._cmpl_pg:
@@ -2172,7 +2447,7 @@ class ExoNitDB:
         it can — safe, just not complete). Safe to call anytime; SQLite degrades
         gracefully.
 
-        Flag ON (Phase 4a): there is no SQLite sidecar left to checkpoint —
+        Flag ON (Fase 4a): there is no SQLite sidecar left to checkpoint —
         this becomes a no-op (DEBUG log), returning ``None``.
         """
         if self._cmpl_pg:
@@ -2317,7 +2592,7 @@ class ExoNitDB:
 
     def get_task_row_and_assign(self, task_id, worker_id):
         """Claim-time PK lookup + assign for the primary work-stream path
-        (Phase 1, Task 5): given a task_id claimed from the "primary" work
+        (Fase 1, Task 5): given a task_id claimed from the "primary" work
         stream, verify it is still assignable and, if so, perform the SAME
         assigned_to/assigned_at/attempts+1 UPDATE get_and_assign_task does —
         so the PG mirror this path writes is byte-identical to the legacy
@@ -2373,7 +2648,7 @@ class ExoNitDB:
 
     def reconcile_dlq_task(self, task_id, max_attempts=MAX_TASK_ATTEMPTS):
         """Status-guarded counterpart to requeue_or_fail_task, used ONLY by
-        the primary work-stream's DLQ reconciliation (Phase 1, Task 5 — see
+        the primary work-stream's DLQ reconciliation (Fase 1, Task 5 — see
         routes/workers.py's _reconcile_primary_dlq).
 
         A task whose stream message exhausted max_deliveries is moved to
@@ -2879,7 +3154,7 @@ class ExoNitDB:
             f"DELETE FROM worker_telemetry WHERE {ts_col} < {now_minus}",
             (f'-{retention_days} days',))
 
-    # --- discovery_runs: durable orchestrator run record (Phase 3, Task 1) -- #
+    # --- discovery_runs: durable orchestrator run record (Fase 3, Task 1) -- #
     # Foundation of the durable-orchestration plan: the discovery orchestrator's
     # state lives in the DB instead of only pipeline_state.json, so a restart
     # can resume from the last checkpoint instead of losing run state.
@@ -3027,7 +3302,7 @@ class ExoNitDB:
     def get_latest_failed_discovery_run(self):
         """Return the most recently updated FAILED discovery_runs row, or None.
 
-        Phase 3 Task 4: fallback resume candidate for POST
+        Fase 3 Task 4: fallback resume candidate for POST
         /api/discovery/resume when there is no active (non-terminal) run —
         i.e. the orchestrator already reached FAILED (via its own step
         failure, the scan endpoint's spawn confirmation, or the dead-run

@@ -291,7 +291,7 @@ class SpocBulkIndex:
         PER-SECTOR ``tesscurl_sector_{sector}_dv.sh`` script.
 
         A per-sector script's rows live under their FINAL sector (§
-        "Key observation" of the spec: multi-sector DV reports are
+        "Observació clau" of the spec: multi-sector DV reports are
         delivered with the last sector's bulk script) — verified against
         the real archive (2026-08-03): every row parsed from a per-sector
         script is single-sector, ``sector_start == sector_end == sector``.
@@ -318,7 +318,7 @@ class SpocBulkIndex:
                     f"DV row (tic={tic}, start={s}, end={e}) does not belong "
                     f"to sector {sector} (expected sector_end == {sector}) — "
                     "the 'DV rows live under their final sector' assumption "
-                    "(spec 'Key observation') does not hold for this script; "
+                    "(spec 'Observació clau') does not hold for this script; "
                     "investigate before trusting this ingest.")
         with self._backend.transaction() as tx:
             tx.execute(

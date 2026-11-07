@@ -163,6 +163,12 @@ class ExoMinerFFIInferer:
             g = global_view(time, flux, period, t0, duration).astype(np.float32)
             l = local_view(time, flux, period, t0, duration).astype(np.float32)
         except ViewError:
+            # OPEN ITEM (docs/reviews/2026-10-15-cnn-exact-zero-scores.md):
+            # this 0.0 is a sentinel, indistinguishable from a real low score
+            # -- the same ambiguity fixed for the CNN (cnn_ffi.py now returns
+            # None). The Rust/Swift workers mirror this 0.0 on purpose. Not
+            # changed yet: exominer_ffi_score feeds the backfill OR-gate and
+            # the verdict, so None here needs its own decision.
             return 0.0  # sparse → conservative reject
 
         c = np.zeros(LOCAL_BINS, dtype=np.float32)

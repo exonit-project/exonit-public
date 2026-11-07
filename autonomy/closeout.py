@@ -1,11 +1,11 @@
 """Automatic lot closeout (spec §4.5, phase 1.5).
 
-For each lot the orchestrator already produces the scorecard+dossier (step_postprocess)
-and the DONE row in `data/discovery/CAMPAIGN.md` + `docs/STATUS.md`
-(step_finalize -> `scripts/discovery_finalize.py`). This module ONLY adds
-what is missing once the pipeline reaches `DONE`:
+For every lot the orchestrator already produces the scorecard+dossier
+(step_postprocess) and the DONE row in `data/discovery/CAMPAIGN.md` +
+`docs/STATUS.md` (step_finalize -> `scripts/discovery_finalize.py`). This
+module ONLY adds what is missing once the pipeline reaches `DONE`:
 
-1. Health-check gate (`scripts/run_health_check.py`) — blocks on CRITICAL.
+1. Health-check gate (`scripts/run_health_check.py`) -- blocks on CRITICAL.
 2. Artifact verification (scorecard + dossier present and consistent).
 3. Conditional ExoMiner augment (only if the lot has ground truth).
 4. Lot summary (reusing `_db_stats`/`_parse_dossier` from
@@ -14,9 +14,9 @@ what is missing once the pipeline reaches `DONE`:
 6. Weekly digest (`data/autonomy/weekly_digest.md`).
 7. Git commit (never push).
 
-`dry_run=True` (default) does all the reads/checks for real but writes no
-digest and makes no commit — it is the mode for the first trial with a real
-lot. `run_cmd` is injectable so tests never run a real subprocess.
+`dry_run=True` (default) performs all reads/checks for real but neither
+writes the digest nor commits -- it is the mode for the first trial with a
+real lot. `run_cmd` is injectable so tests never run a real subprocess.
 """
 
 from __future__ import annotations
@@ -33,12 +33,12 @@ from typing import Any, Optional
 
 from autonomy.config import REPO_ROOT
 
-PY = sys.executable
+PY = os.environ.get("EXONIT_PYTHON", "python3")
 
 # Same import pattern as `discovery_orchestrator.py` to reuse
 # `discovery_finalize.py` without duplicating its logic. Done once, with the
-# subsystem's fixed REPO_ROOT (not the `repo_root` that `close_lot` receives,
-# which in tests points to a tmp_path with no code).
+# subsystem's fixed REPO_ROOT (not the `repo_root` received by `close_lot`,
+# which in tests points to a tmp_path without code).
 _SCRIPTS_DIR = str(REPO_ROOT / "scripts")
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
@@ -71,13 +71,13 @@ def _resolve_db(repo_root: Path) -> str:
 
     Same priority order as the rest of the scripts (e.g.
     `scripts/verify_sector_complete.py::_resolve_db_path`):
-    `EXONIT_DATABASE_URL` (PostgreSQL DSN, production) → `EXONIT_DB_PATH`
-    (explicit SQLite path) → `data/exonit.db` (archived SQLite by default).
+    `EXONIT_DATABASE_URL` (PostgreSQL DSN, production) -> `EXONIT_DB_PATH`
+    (explicit SQLite path) -> `data/exonit.db` (archived SQLite by default).
 
     Production runs on PostgreSQL via `EXONIT_DATABASE_URL` (systemd
-    `EnvironmentFile=<repo>/.env`); without that environment loaded
-    the closeout would silently fall back to the archived SQLite and the summary would come out
-    empty (n_completed=0, everything in n_other) even though the real lot is
+    `EnvironmentFile`); without that environment loaded the closeout would
+    silently fall back to the archived SQLite and the summary would come out
+    empty (n_completed=0, everything in n_other) even if the real lot is
     100% completed in PostgreSQL.
     """
     if os.environ.get("EXONIT_DATABASE_URL"):
@@ -146,9 +146,9 @@ def _augment_exominer(
 ) -> tuple[str, str, str]:
     """Return (step_status, step_detail, digest_label).
 
-    `dry_run=True` ONLY reads the lot_csv header to decide whether
-    the augment would apply — it never runs `augment_scorecard_exominer_from_db.py`
-    (it writes 3 real files to disk, it is not a read/check).
+    `dry_run=True` ONLY reads the lot_csv header to decide whether the
+    augment would apply -- it never runs `augment_scorecard_exominer_from_db.py`
+    (it writes 3 real files to disk, so it is not a read/check).
     """
     try:
         with lot_csv_path.open(newline="", encoding="utf-8") as fh:
@@ -179,7 +179,7 @@ def _augment_exominer(
     try:
         proc = run_cmd(cmd, cwd=str(repo_root), capture_output=True, text=True, timeout=600)
     except Exception as exc:  # noqa: BLE001
-        return "warning", f"ExoMiner augment failed to run: {exc!r}", "done (error on run)"
+        return "warning", f"ExoMiner augment failed to run: {exc!r}", "done (error while running)"
 
     rc = getattr(proc, "returncode", 1)
     if rc == 0:
@@ -260,7 +260,7 @@ def _build_summary(
 
 
 # ---------------------------------------------------------------------------
-# Step 6: verify CAMPAIGN.md (read-only, we never modify it here)
+# Step 6: verify CAMPAIGN.md (read-only, never modified here)
 # ---------------------------------------------------------------------------
 
 def _verify_campaign(lot_csv_basename: str, repo_root: Path) -> tuple[str, str]:
@@ -345,11 +345,11 @@ def _commit(
     status_so_far: str,
 ) -> tuple[str, str]:
     if dry_run:
-        return "skipped", "commit not made (dry_run)"
+        return "skipped", "commit not performed (dry_run)"
     if not commit:
-        return "skipped", "commit not made (commit=False)"
+        return "skipped", "commit not performed (commit=False)"
     if status_so_far == "blocked":
-        return "skipped", "commit not made (status=blocked)"
+        return "skipped", "commit not performed (status=blocked)"
 
     candidate_paths = [
         repo_root / "data" / "scorecards" / f"{run_id}.json",
@@ -364,7 +364,7 @@ def _commit(
     try:
         run_cmd(["git", "add"] + existing, cwd=str(repo_root), capture_output=True, text=True)
         # Explicit pathspec: we only care whether there ARE staged changes in
-        # THESE 4 paths — not anything else the operator may have
+        # THESE 4 paths -- not in anything else the operator may have
         # staged in the live prod checkout.
         diff_proc = run_cmd(
             ["git", "diff", "--cached", "--quiet", "--"] + existing, cwd=str(repo_root),
@@ -381,8 +381,8 @@ def _commit(
         "Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
     )
     try:
-        # Explicit pathspec in the commit too: it never takes along anything else
-        # the operator may have staged in the live prod checkout.
+        # Explicit pathspec on the commit too: it never picks up anything else
+        # the operator had staged in the live prod checkout.
         commit_proc = run_cmd(
             ["git", "commit", "-m", message, "--"] + existing, cwd=str(repo_root),
             capture_output=True, text=True,
@@ -419,11 +419,11 @@ def close_lot(
     repo_root: Path = REPO_ROOT,
     run_cmd=subprocess.run,
 ) -> CloseoutResult:
-    """Close a lot that has already reached `DONE` (spec §4.5). See the module docstring."""
+    """Close a lot that has already reached `DONE` (spec §4.5). See module docstring."""
     repo_root = Path(repo_root)
     steps: list[dict] = []
 
-    # --- Step 1: read state ------------------------------------------------
+    # --- Step 1: read state -------------------------------------------------
     try:
         data = json.loads(Path(state_path).read_text(encoding="utf-8"))
     except Exception as exc:  # noqa: BLE001
@@ -436,7 +436,7 @@ def close_lot(
     if state != "DONE":
         _step(
             steps, "read_state", "blocked",
-            f"pipeline state is {state!r}, not 'DONE' — the lot is not closed",
+            f"pipeline state is {state!r}, not 'DONE' -- the lot is not closed",
         )
         return CloseoutResult(run_id=run_id, status="blocked", steps=steps, summary={})
 
@@ -453,42 +453,42 @@ def close_lot(
     dossier_path = _abs(dossier, repo_root)
     db_path = _resolve_db(repo_root)
 
-    # --- Step 2: health check (gate) -----------------------------------------
+    # --- Step 2: health check (gate) ----------------------------------------
     hc_status, hc_detail = _run_health_check(repo_root, run_cmd)
     _step(steps, "health_check", hc_status, hc_detail)
     health_label = {"ok": "ok", "warning": "warning", "blocked": "critical"}[hc_status]
     if hc_status != "ok":
         health_label = f"{health_label} {hc_detail}"
 
-    # --- Step 3: verify artifacts ----------------------------------------
+    # --- Step 3: verify artifacts -------------------------------------------
     art_status, art_detail = _verify_artifacts(run_id, scorecard_json, dossier, repo_root)
     _step(steps, "verify_artifacts", art_status, art_detail)
 
-    # --- Step 4: conditional ExoMiner augment --------------------------------
+    # --- Step 4: conditional ExoMiner augment -------------------------------
     aug_status, aug_detail, augment_label = _augment_exominer(
         lot_csv_path, scorecard_json, repo_root, run_cmd, dry_run
     )
     _step(steps, "augment_exominer", aug_status, aug_detail)
 
-    # --- Step 5: lot summary ------------------------------------------------
+    # --- Step 5: lot summary -------------------------------------------------
     sum_status, sum_detail, summary = _build_summary(
         lot_csv_raw, lot_csv_path, dossier_path, db_path, started_at, finished_at, sector,
     )
     _step(steps, "summary", sum_status, sum_detail)
 
-    # --- Step 6: verify CAMPAIGN.md (read-only) ---------------------------
+    # --- Step 6: verify CAMPAIGN.md (read-only) -----------------------------
     lot_csv_basename = Path(lot_csv_raw).name
     camp_status, camp_detail = _verify_campaign(lot_csv_basename, repo_root)
     _step(steps, "verify_campaign", camp_status, camp_detail)
 
-    # --- Step 7: weekly digest ----------------------------------------------
+    # --- Step 7: weekly digest -----------------------------------------------
     status_so_far = _overall_status(steps)
     dig_status, dig_detail = _write_digest(
         repo_root, run_id, summary, health_label, augment_label, status_so_far, dry_run,
     )
     _step(steps, "digest", dig_status, dig_detail)
 
-    # --- Step 8: git commit (never push) --------------------------------------
+    # --- Step 8: git commit (never push) -------------------------------------
     status_before_commit = _overall_status(steps)
     commit_status, commit_detail = _commit(
         repo_root, run_id, run_cmd, dry_run, commit, status_before_commit,

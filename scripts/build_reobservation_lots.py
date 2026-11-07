@@ -12,7 +12,7 @@ sector, excluding (tic, sector) pairs already completed in
 Dry-run by default (counts only). ``--write`` emits per target sector:
   data/discovery/reobs_s<target:04d>_from_s<src:04d>_<ts>.csv   (tic_id,label)
   data/discovery/reobs_s<target:04d>_from_s<src:04d>_<ts>.json  (manifest)
-and prints a plans.yaml snippet (approved_by EMPTY: the operator approves).
+and prints a plans.yaml snippet (approved_by EMPTY: the owner approves).
 Read-only on every DB.
 """
 from __future__ import annotations
@@ -81,7 +81,7 @@ def group_by_target_sector(tics, tglc_sectors_by_tic, excluded_pairs, src_sector
 def plan_snippet(target, src, csv_path, n):
     return (
         f"  - plan_id: reobs-s{target:04d}-from-s{src:04d}\n"
-        f"    approved_by:             # EMPTY: operator approves before the supervisor runs it\n"
+        f"    approved_by:             # EMPTY: the owner approves before the supervisor runs it\n"
         f"    sector: {target}\n"
         f"    mode: deep_rescan\n"
         f"    worklist: {csv_path}\n"

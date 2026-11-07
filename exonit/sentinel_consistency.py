@@ -1,7 +1,7 @@
 """Shared logic for the ExoMiner-SPOC ``-1`` sentinel consistency invariant.
 
-The invariant (docs/superpowers/specs/exominer-dv-gate.md, "Step 1: the
-SPOC-gate must decide by DV, not by SPOC" — corrected by
+The invariant (docs/superpowers/specs/exominer-dv-gate.md, "Pas 1: el
+SPOC-gate ha de decidir per DV, no per SPOC" — corrected by
 docs/superpowers/specs/exominer-dv-gate-sector.md, 2026-07-14):
 
     No candidate may have ``stars.has_spoc = 1`` AND
@@ -93,7 +93,7 @@ def find_suspicious_sentinel_candidates(
 def count_status_score_violations(db: ExoNitDB) -> dict:
     """Count rows where ``candidates.exominer_status`` contradicts
     ``candidates.exominer_score`` (docs/superpowers/specs/exominer-status-
-    column.md — "Consistency").
+    column.md — "Consistència").
 
     Invariant (mirrors ``exonit.db.derive_exominer_status``'s corrected rule
     — the -1 sentinel is the only special-cased score value, so 'scored'

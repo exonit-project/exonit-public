@@ -60,7 +60,7 @@ _BULK_POST_RETRY_BACKOFF_S = 1.0
 # `metadata_preserved_non_tglc` keys are ALWAYS present regardless of flags
 # or outcome — 2026-09-26 review fix (a bare `{}` on the legacy path meant
 # these keys were silently absent whenever EXONIT_ENQUEUE_METADATA_V2=0, the
-# default; operator decision §8.5 makes `metadata_refreshed` a mandatory
+# default; the owner's decision §8.5 makes `metadata_refreshed` a mandatory
 # dossier field, so a future consumer must never see it missing).
 _ZERO_METADATA_COUNTS = {
     "metadata_created": 0, "metadata_refreshed": 0,

@@ -44,6 +44,8 @@ from exonit.ffi_finalist_checks import (  # noqa: E402
     angular_separation_deg,
     shared_signal_groups,
 )
+from exonit.harmonic_dedup import find_harmonic_duplicates  # noqa: E402
+from exonit import physical_sanity as _phys  # noqa: E402
 from exonit.metadata_cache import MetadataCache  # noqa: E402
 from exonit.systematic_veto import (  # noqa: E402
     find_systematic_periods, find_systematic_periods_columnar, ColumnarPopulation,
@@ -52,6 +54,9 @@ from exonit.systematic_veto import (  # noqa: E402
     partition_deep_veto_targets, MAX_PLANET_RADIUS_RJUP,
 )
 from exonit.systematic_families_io import load_families  # noqa: E402
+from exonit.systematic_veto_v2 import (  # noqa: E402
+    veto_v2_enabled, veto_v2_shadow, find_systematic_families_v2, soft_family,
+)
 from exonit.progress_client import ProgressReporter  # noqa: E402
 from exonit.transit_math import fold_and_measure_depth  # noqa: E402
 
@@ -677,6 +682,23 @@ def _fpp_timeout_summary_line(timed_out_tics: list, n_timeout: int,
             f"(exceeded {timeout_seconds:.0f}s): TIC {tics_str}")
 
 
+def _veto_kwargs(row):
+    """duration/depth/snr/sector of a candidate row for ``is_vetoed`` (veto v2).
+
+    v1 families ignore them, so passing them is always safe; a missing key (a
+    narrower SELECT, a sqlite3.Row without it) is simply ``None`` = "skip that
+    similarity test".
+    """
+    out = {}
+    for kw, key in (("duration", "duration_days"), ("depth", "depth_ppm"),
+                    ("snr", "snr"), ("sector", "sector")):
+        try:
+            out[kw] = row[key]
+        except (KeyError, IndexError, TypeError):
+            out[kw] = None
+    return out
+
+
 def _strong_candidate_passes(row, sysp, eb_hosts, depth_gate_ids, toi_protection):
     """Step 2+3 survivor-selection row predicate — extracted for testability.
 
@@ -702,11 +724,176 @@ def _strong_candidate_passes(row, sysp, eb_hosts, depth_gate_ids, toi_protection
     if row["id"] in depth_gate_ids:
         return False
     protected = is_toi_protected(row["tic_id"], row["period_days"], toi_protection)
-    if is_vetoed(row["period_days"], row["t0"], sysp) and not protected:
+    if is_vetoed(row["period_days"], row["t0"], sysp, **_veto_kwargs(row)) and not protected:
         return False
     if row["tic_id"] in eb_hosts and not protected:
         return False
     return True
+
+
+def _harmonic_dedup_enabled() -> bool:
+    """EXONIT_HARMONIC_DEDUP (default ON; ``0`` restores the old selection)."""
+    return os.environ.get("EXONIT_HARMONIC_DEDUP", "1").strip() != "0"
+
+
+def _select_strong_best(chunk, passes, dup_lookup=None, dup_log=None, best=None,
+                        keeper_is_strong=None):
+    """Per-TIC best strong row of one chunk (rows pre-sorted by v6 DESC).
+
+    ``passes(row)`` is the veto predicate. ``dup_lookup(chunk_rows)`` (None =
+    harmonic dedup OFF) returns {candidate id: (keeper, k)}; a row in it is
+    skipped (the next-best row of the TIC, e.g. the stronger fundamental,
+    may then be selected) and appended to ``dup_log`` for the dossier. Only
+    rows that passed the veto predicate are logged. Extracted for testability.
+
+    ``keeper_is_strong(keeper)`` (None = always True): a duplicate is only
+    DROPPED when its stronger fundamental is itself a strong row. Otherwise the
+    duplicate stays selectable (no TIC leaves the strong list in Phase 1) and
+    is logged with ``dropped=False`` for a dossier annotation.
+    """
+    best = {} if best is None else best
+    dups = dup_lookup(chunk) if dup_lookup is not None else {}
+    for r in chunk:
+        if not passes(r):
+            continue
+        if r["id"] in dups:
+            keeper, k = dups[r["id"]]
+            drop = keeper_is_strong is None or bool(keeper_is_strong(keeper))
+            if dup_log is not None:
+                dup_log.append({"tic_id": r["tic_id"], "id": r["id"],
+                                "period_days": r["period_days"], "snr": r["snr"],
+                                "kept_period_days": keeper["period_days"],
+                                "kept_snr": keeper["snr"], "k": k,
+                                "dropped": drop})
+            if drop:
+                continue
+        best.setdefault(r["tic_id"], r)
+    return best
+
+
+def _harmonic_dup_lookup_factory(con, toi_protection):
+    """dup_lookup for _select_strong_best backed by a same-TIC/sector query."""
+    def lookup(chunk):
+        tics_c = sorted({r["tic_id"] for r in chunk})
+        # only the sectors of the chunk rows: other sectors are never compared
+        sectors_c = sorted({int(r["sector"]) for r in chunk if r["sector"] is not None})
+        if not tics_c or not sectors_c:
+            return {}
+        allc = select_in_chunks(
+            con.execute,
+            "SELECT id,tic_id,sector,period_days,t0,duration_days,snr,"
+            "claude_verdict,exominer_ffi_score FROM candidates "
+            "WHERE tic_id IN",
+            tics_c,
+            sql_after="AND period_days IS NOT NULL AND sector IN ("
+                      + ",".join(str(x) for x in sectors_c) + ")")
+        prot = {c["id"] for c in allc
+                if is_toi_protected(c["tic_id"], c["period_days"], toi_protection)}
+        return find_harmonic_duplicates([dict(c) for c in allc], protected_ids=prot)
+    return lookup
+
+
+def _harmonic_dedup_dossier_lines(dup_log) -> list:
+    """Dossier section for harmonic duplicates (bullets, no table, so
+    build_public_results' table/finalist parsers are unaffected). N in the
+    heading = rows actually dropped; duplicates whose fundamental is not
+    strong are kept in the strong list and annotated."""
+    dropped = [d for d in dup_log if d.get("dropped", True)]
+    kept = [d for d in dup_log if not d.get("dropped", True)]
+    out = ["", f"## Harmonic duplicates removed: {len(dropped)}", ""]
+    if not dup_log:
+        out.append("No strong candidate was a P/k or k*P duplicate (same TIC and "
+                   "sector, coincident epochs, lower SNR) of a stronger candidate.")
+        return out
+    key = lambda x: (x["tic_id"], x["period_days"])  # noqa: E731
+    if dropped:
+        out.append("Each was a sub/super-harmonic of a higher-SNR strong candidate of "
+                   "the same TIC and sector with coincident transit epochs, and was NOT "
+                   "selected as strong/finalist (EXONIT_HARMONIC_DEDUP=1).")
+        out.append("")
+        for d in sorted(dropped, key=key):
+            snr = d["snr"] if d["snr"] is not None else float("nan")
+            out.append(f"- TIC {d['tic_id']}: dropped P={d['period_days']:.4f} d "
+                       f"(SNR {snr:.1f}); kept P={d['kept_period_days']:.4f} d "
+                       f"(SNR {d['kept_snr']:.1f}); k={d['k']}")
+    if kept:
+        out += ["", "Aliases kept in the strong list (fundamental not strong):", ""]
+        for d in sorted(kept, key=key):
+            out.append(f"- TIC {d['tic_id']}: P={d['period_days']:.4f} d: alias of "
+                       f"P={d['kept_period_days']:.4f} d (fundamental not strong; "
+                       f"kept); k={d['k']}")
+    return out
+
+
+def _lc_load_recovered_keys(con, tics):
+    """{(tic, sector|None)} of tasks whose light curve came from the worker's FFI
+    fallback (``tasks.lc_load_recovered``). READ-ONLY."""
+    out = set()
+    for chunk in _select_in_chunks_iter(
+            con, "SELECT tic_id, sector FROM tasks WHERE tic_id IN", list(tics),
+            sql_after=" AND lc_load_recovered = ?", params_extra=(True,)):
+        for r in chunk:
+            out.add((str(r["tic_id"]), None if r["sector"] is None else int(r["sector"])))
+    return out
+
+
+def _physical_sanity_step(rows, final, mc, stellar_radii, mast_params, recovered=None,
+                          lot_sector=None):
+    """Physical-sanity annotations for the strong rows + hard-flag finalist cut.
+
+    Returns (entries, final_kept, excluded): ``entries`` = [(tic, record,
+    printed_period)] in strong-table order, ``final_kept`` = ``final`` without
+    the rp_implausible / giant_host finalists, ``excluded`` = [(tic, flags)].
+    R* priority: metadata cache > postprocess R* map (incl. MAST fallback) >
+    TICv8 server cache; RUWE from the server's Gaia cache (absent -> empty).
+    EXONIT_TGLC_DEPTH_CORR: light-curve product from the metadata entry's
+    ``fits_files`` (the files the worker stitched), NEAREDGE from the server-side
+    TGLC header cache (EXONIT_TGLC_HEADER_CACHE; absent -> edge unchecked).
+    ``recovered`` ({(tic, sector)} of FFI-fallback tasks, or
+    ``physical_sanity.RECOVERED_ALL``): those rows are left uncorrected
+    (``lc_source_unknown``); a row without a sector key uses ``lot_sector``.
+    No online call is made here.
+    """
+    cache_dir = os.environ.get("EXONIT_PHYS_CACHE_DIR", str(ROOT / "data"))
+    tics = sorted({s["tic_id"] for s in rows})
+    meta, fits_files = {}, {}
+    for t in tics:
+        try:
+            e = mc.get_entry(t)
+        except Exception:  # noqa: BLE001 - annotation must never break postprocess
+            e = None
+        if e:
+            meta[t] = {"rad": e.get("stellar_radius"), "teff": e.get("teff"),
+                       "logg": e.get("logg")}
+            fits_files[t] = e.get("fits_files")
+    tic_set = set(tics)
+    rad_map = {t: {"rad": r, "teff": None, "logg": None}
+               for t, r in stellar_radii.items() if t in tic_set}
+    stellar = _phys.merge_stellar(meta, rad_map, mast_params,
+                                  _phys.load_ticv8_stellar(tics, cache_dir))
+    ruwe = _phys.load_ruwe(tics, cache_dir)
+    lc_source, near_edge = {}, {}
+    if _phys.tglc_corr_enabled():
+        try:
+            lc_source, near_edge = _phys.tic_source_info(
+                fits_files, _phys.tglc_header_cache_path())
+        except Exception as exc:  # noqa: BLE001 - unknown source -> uncorrected + flagged
+            print(f"[phys-sanity] lc-source lookup failed ({exc!r}); rows left uncorrected")
+    cands = [s if s.get("sector") is not None or lot_sector is None
+             else dict(s, sector=lot_sector) for s in rows]
+    recs = _phys.assess_many(cands, stellar, ruwe,
+                             t0_is_centre=_phys.t0_is_centre_env(),
+                             lc_source=lc_source, near_edge=near_edge,
+                             recovered=recovered)
+    entries = [(s["tic_id"], recs[s["id"]], None)
+               for s in sorted(rows, key=lambda x: -x["exominer_ffi_score"])]
+    # each finalist is judged on ITS OWN candidate record (depth/period), not on
+    # another candidate of the same TIC
+    excluded = [(s["tic_id"], recs[s["id"]]["flags"]) for s in final
+                if s["id"] in recs and _phys.hard_excluded(recs[s["id"]])]
+    ex_ids = {s["id"] for s in final if s["id"] in recs
+              and _phys.hard_excluded(recs[s["id"]])}
+    return entries, [s for s in final if s["id"] not in ex_ids], excluded
 
 
 def _resolve_systematic_periods(pop, args, common_period_min_tics):
@@ -745,6 +932,16 @@ def _resolve_systematic_periods(pop, args, common_period_min_tics):
     # thousands of candidates) even a modest concentration is statistically
     # significant (3000 TICs × conc=0.44 >> noise floor). Using 0.5 missed
     # the P~1.68d systematic that only reaches conc=0.445 at campaign scale.
+    if veto_v2_enabled():
+        # EXONIT_VETO_V2 (default OFF): density-excess families + similarity +
+        # soft tag (exonit/systematic_veto_v2.py).  EXONIT_VETO_V2=0 -> the v1
+        # branch below, unchanged.
+        if not isinstance(pop, ColumnarPopulation):
+            pop = ColumnarPopulation.from_rows(pop, with_shape=True)
+        fams = find_systematic_families_v2(pop)
+        print(f"[veto-v2] {len(fams)} density-excess families "
+              f"({sum(1 for f in fams if f['epoch_agnostic'])} epoch-agnostic)")
+        return fams
     kwargs = dict(min_stars=10, min_concentration=0.4,
                   common_period_min_tics=common_period_min_tics,
                   common_period_max_period=args.common_period_max_period)
@@ -797,6 +994,90 @@ def _cross_sector_dossier_lines(n, hits):
                      f"P={m0['cur_period']:.4f} d ~ s{m0['other_sector']} "
                      f"P={m0['other_period']:.4f} d ({m0['kind']})")
     return lines
+
+
+def _shadow_stem(out_path):
+    return (out_path[:-len("_dossier.md")] if out_path.endswith("_dossier.md")
+            else str(Path(out_path).with_suffix("")))
+
+
+def _veto_v2_shadow_fail(stage, exc, out_path):
+    """Make a shadow failure visible: a ``WARNING veto-v2-shadow:`` stdout line (the orchestrator
+    surfaces it, like ``WARNING fpp-timeout:``), the traceback, and a stub side report."""
+    import traceback
+    print(f"WARNING veto-v2-shadow: {stage} failed ({exc!r}); postprocess result unaffected, "
+          f"no shadow evidence for this lot")
+    print("[veto-v2-shadow] traceback:\n" + traceback.format_exc())
+    try:
+        from exonit.veto_v2_shadow import failure_stub
+        failure_stub(_shadow_stem(out_path), stage, exc)
+    except Exception as exc2:  # noqa: BLE001
+        print(f"[veto-v2-shadow] could not write the failure stub: {exc2!r}")
+
+
+def _veto_v2_shadow_step(con, tics, args, sysp_v1, sysp_v2, toi_protection, stellar_radii,
+                         depth_gate_ids, survivors, final, shadow_meta=None):
+    """EXONIT_VETO_V2=shadow side report.  READ-ONLY (SELECTs only) and exception-proof: any
+    failure is caught and logged and the postprocess result is unchanged.  v1 drove every
+    decision above; here the strong selection is recomputed on the SAME pool (rows that are
+    planet_candidate OR were demoted by SYSTEMATIC_VETO, em_ffi > v6_min) under v1 and v2
+    and diffed.  Writes ``<out stem>_veto_v2_shadow.{json,md}`` next to the dossier."""
+    try:
+        from exonit.veto_v2_shadow import build_report, write_report
+        sector_sql = f" AND sector={int(args.sector)}" if args.sector is not None else ""
+        pool = []
+        for chunk in _select_in_chunks_iter(
+                con,
+                "SELECT id,tic_id,sector,period_days,t0,duration_days,depth_ppm,snr,"
+                "exominer_ffi_score,claude_verdict,cross_source_name,triceratops_fpp,"
+                "triceratops_verdict FROM candidates WHERE tic_id IN",
+                list(tics),
+                sql_after="AND period_days IS NOT NULL AND t0 IS NOT NULL AND "
+                          "(claude_verdict='planet_candidate' OR cross_source_name IN "
+                          "('SYSTEMATIC_VETO','DEEP_SYSTEMATIC_VETO')) "
+                          "AND exominer_ffi_score>?" + sector_sql + " ORDER BY exominer_ffi_score DESC",
+                params_extra=(args.v6_min,)):
+            pool.extend(dict(r) for r in chunk)
+        was_pc = lambda k: (k.get("claude_verdict") == "planet_candidate"  # noqa: E731
+                            or k.get("cross_source_name") in ("SYSTEMATIC_VETO", "DEEP_SYSTEMATIC_VETO"))
+        # depth gate on the SAME pool for both arms (the real Step 1b excludes rows v1 already
+        # vetoed, which would let a v1-vetoed giant show up as a v2 "gain"); union with the real set
+        gate_ids = set(depth_gate_ids) | {c["id"] for c in apply_depth_gate(
+            [r for r in pool if r.get("depth_ppm")], stellar_radii)}
+
+        def eb_for(sysp):
+            return find_deep_eclipse_hosts(
+                chain.from_iterable(_select_in_chunks_iter(
+                    con,
+                    "SELECT tic_id, period_days, t0, depth_ppm, duration_days, snr, sector "
+                    "FROM candidates WHERE tic_id IN", list(tics))),
+                sysp, stellar_radii, deep_eclipse_ppm=args.deep_eclipse_ppm)
+
+        def strong_for(sysp):
+            eb = eb_for(sysp)
+            lookup = _harmonic_dup_lookup_factory(con, toi_protection) if _harmonic_dedup_enabled() else None
+            passes = lambda r: _strong_candidate_passes(r, sysp, eb, gate_ids, toi_protection)  # noqa: E731
+            return _select_strong_best(
+                pool, passes, dup_lookup=lookup, dup_log=[], best={},
+                keeper_is_strong=lambda k: (was_pc(k) and k.get("exominer_ffi_score") is not None
+                                            and k["exominer_ffi_score"] > args.v6_min and passes(k)))
+
+        best1, best2 = strong_for(sysp_v1), strong_for(sysp_v2)
+        # third arm: v2 without the T0-event layer (marginal effect of that layer)
+        best3 = strong_for([f for f in sysp_v2 if f.get("kind") != "t0_events"])
+        import resource
+        meta = dict(shadow_meta or {})
+        meta["ru_maxrss_kb_at_report"] = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        rep = build_report(Path(args.out).name, best1, best2, final, sysp_v1, sysp_v2,
+                           n_real_survivors=len(survivors), meta=meta, best_v2_noT0=best3,
+                           note=f"pool rows: {len(pool)} (planet_candidate or demoted by SYSTEMATIC_VETO / "
+                                f"DEEP_SYSTEMATIC_VETO); depth gate recomputed on the pool for both arms; "
+                                f"sector filter: {args.sector}")
+        files = write_report(rep, _shadow_stem(args.out))
+        print(f"[veto-v2-shadow] strong TICs v1 {len(best1)} -> v2 {len(best2)} "
+              f"(+{rep['gained_strong_tics']} / -{rep['lost_strong_tics']}), without T0 layer {len(best3)}; wrote {files[0]}, {files[1]}")
+    except Exception as exc:  # noqa: BLE001 - shadow must never fail the postprocess
+        _veto_v2_shadow_fail("report", exc, args.out)
 
 
 def main():
@@ -964,26 +1245,47 @@ def main():
         # columnar builder (chain.from_iterable flattens the per-chunk lists
         # select_in_chunks_iter yields into the flat row iterable
         # ColumnarPopulation.from_rows expects).
+        _v2 = (veto_v2_enabled() or veto_v2_shadow()) and not args.systematic_periods
         pop = ColumnarPopulation.from_rows(chain.from_iterable(
             _select_in_chunks_iter(
                 con,
-                "SELECT tic_id,period_days,t0 FROM candidates WHERE tic_id IN",
+                ("SELECT tic_id,period_days,t0,duration_days,depth_ppm,sector "
+                 if _v2 else "SELECT tic_id,period_days,t0 ")
+                + "FROM candidates WHERE tic_id IN",
                 list(tics),
-                sql_after="AND period_days IS NOT NULL AND t0 IS NOT NULL")))
+                sql_after="AND period_days IS NOT NULL AND t0 IS NOT NULL")),
+            with_shape=_v2)
     else:
         # campaign / all: full DB population for detection; apply veto only to
         # the current sample's planet_candidates (we don't re-process old lots
         # here). execute_stream drains the whole `candidates` table without
         # ever materializing it — same flattening as the sample-scope branch.
+        _v2 = (veto_v2_enabled() or veto_v2_shadow()) and not args.systematic_periods
         pop = ColumnarPopulation.from_rows(chain.from_iterable(
             con.execute_stream(
-                "SELECT tic_id,period_days,t0 FROM candidates "
-                "WHERE period_days IS NOT NULL AND t0 IS NOT NULL")))
+                ("SELECT tic_id,period_days,t0,duration_days,depth_ppm,sector "
+                 if _v2 else "SELECT tic_id,period_days,t0 ")
+                + "FROM candidates "
+                "WHERE period_days IS NOT NULL AND t0 IS NOT NULL")), with_shape=_v2)
     print(f"[veto] scope={args.veto_scope}: {len(pop)} candidates in detection population")
     common_period_min_tics = args.common_period_min_tics if args.common_period_min_tics > 0 else None
     # See _resolve_systematic_periods above for the live-vs-frozen branch
     # (--systematic-periods) and the min_concentration=0.4 rationale.
     sysp = _resolve_systematic_periods(pop, args, common_period_min_tics)
+    # EXONIT_VETO_V2=shadow: build the v2 families too (never used to decide anything).
+    shadow_fams, shadow_meta = None, {}
+    if veto_v2_shadow() and not args.systematic_periods:
+        try:
+            import resource
+            import time as _t
+            _t0 = _t.time()
+            shadow_fams = find_systematic_families_v2(pop)
+            shadow_meta = {"v2_build_seconds": round(_t.time() - _t0, 1), "population_rows": int(len(pop)),
+                           "ru_maxrss_kb_after_build": int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)}
+            print(f"[veto-v2-shadow] {len(shadow_fams)} v2 families built (shadow only) "
+                  f"in {shadow_meta['v2_build_seconds']} s, ru_maxrss {shadow_meta['ru_maxrss_kb_after_build']} kB")
+        except Exception as exc:  # noqa: BLE001 - shadow must never fail the postprocess
+            _veto_v2_shadow_fail("build_families", exc, args.out)
     # F2.1 (2026-08-01): `pop` (the campaign-wide columnar population, ~530 MB
     # at 22 M rows) is never touched again after this point — the veto is
     # evaluated with is_vetoed(period, t0, sysp) over `sample_cands` below,
@@ -996,11 +1298,21 @@ def main():
     # alive until here; now it's its own query and `allc` never exists).
     sample_cands = select_in_chunks(
         con.execute,
-        "SELECT id,tic_id,period_days,t0,claude_verdict FROM candidates WHERE tic_id IN",
+        ("SELECT id,tic_id,period_days,t0,claude_verdict,duration_days,depth_ppm,snr,sector "
+         if veto_v2_enabled() else "SELECT id,tic_id,period_days,t0,claude_verdict ")
+        + "FROM candidates WHERE tic_id IN",
         list(tics),
         sql_after="AND period_days IS NOT NULL AND t0 IS NOT NULL")
     vetoed_pc_raw = [c for c in sample_cands if c["claude_verdict"] == "planet_candidate"
-                     and is_vetoed(c["period_days"], c["t0"], sysp)]
+                     and is_vetoed(c["period_days"], c["t0"], sysp, **_veto_kwargs(c))]
+    if any(f.get("v2") for f in sysp):
+        # veto v2 soft tag: epoch-agnostic family match with SNR >= V2_SNR_SOFT is NOT
+        # demoted; it is annotated in the dossier (strong survivors only, below).
+        n_soft = sum(1 for c in sample_cands if c["claude_verdict"] == "planet_candidate"
+                     and soft_family(c["period_days"], c["t0"], sysp,
+                                     **_veto_kwargs(c)))
+        print(f"[veto-v2] {n_soft} planet_candidate row(s) soft-tagged "
+              "(high-SNR on an epoch-agnostic family; not demoted)")
     # Anti-TOI override: drop confirmed (KP/CP) planets from the veto list.
     vetoed_pc, n_anti_toi_protected = filter_anti_toi_protected(
         vetoed_pc_raw, toi_protection, "SYSTEMATIC_VETO")
@@ -1018,6 +1330,7 @@ def main():
     mc_con = sqlite3.connect(ExoNitConfig().metadata_cache_path)
     mc_con.row_factory = sqlite3.Row
     stellar_radii: dict[str, float] = {}
+    mast_stellar_params: dict[str, dict] = {}   # MAST fallback {rad,teff,logg}
     for tic in tics:
         row = mc_con.execute(
             "SELECT stellar_radius FROM metadata WHERE tic_id=?", (tic,)
@@ -1082,7 +1395,9 @@ def main():
     eb_hosts = find_deep_eclipse_hosts(
         chain.from_iterable(_select_in_chunks_iter(
             con,
-            "SELECT tic_id, period_days, t0, depth_ppm FROM candidates WHERE tic_id IN",
+            ("SELECT tic_id, period_days, t0, depth_ppm, duration_days, snr, sector "
+             if veto_v2_enabled() else "SELECT tic_id, period_days, t0, depth_ppm ")
+            + "FROM candidates WHERE tic_id IN",
             list(tics),
         )),
         sysp, stellar_radii,
@@ -1163,20 +1478,36 @@ def main():
     # scores deterministic (previously broken by backend row-arrival order —
     # the one accepted behaviour divergence in this change, see spec §5).
     best = {}
+    harmonic_dedup_on = _harmonic_dedup_enabled()
+    harmonic_dup_log: list = []
+    _harmonic_dup_lookup = (_harmonic_dup_lookup_factory(con, toi_protection)
+                            if harmonic_dedup_on else None)
     for chunk in _select_in_chunks_iter(
             con,
-            "SELECT id,tic_id,period_days,t0,duration_days,depth_ppm,snr,"
+            "SELECT id,tic_id,sector,period_days,t0,duration_days,depth_ppm,snr,"
             "exominer_ffi_score,triceratops_fpp,triceratops_verdict "
             "FROM candidates WHERE tic_id IN",
             list(tics),
             sql_after="AND claude_verdict='planet_candidate' AND exominer_ffi_score>? "
                       "ORDER BY exominer_ffi_score DESC",
             params_extra=(args.v6_min,)):
-        for r in chunk:
-            if _strong_candidate_passes(r, sysp, eb_hosts, depth_gate_ids, toi_protection):
-                best.setdefault(r["tic_id"], r)
+        _select_strong_best(
+            chunk,
+            lambda r: _strong_candidate_passes(r, sysp, eb_hosts, depth_gate_ids, toi_protection),
+            dup_lookup=_harmonic_dup_lookup, dup_log=harmonic_dup_log, best=best,
+            keeper_is_strong=lambda k: (
+                k.get("claude_verdict") == "planet_candidate"
+                and k.get("exominer_ffi_score") is not None
+                and k["exominer_ffi_score"] > args.v6_min
+                and _strong_candidate_passes(k, sysp, eb_hosts, depth_gate_ids,
+                                             toi_protection)))
     survivors = sorted(best.values(), key=lambda r: (-r["exominer_ffi_score"], r["tic_id"]))
     print(f"[layer3] {len(survivors)} strong candidates (post-veto) to vet")
+    if harmonic_dedup_on:
+        _nd = sum(1 for d in harmonic_dup_log if d["dropped"])
+        print(f"[harmonic-dedup] {_nd} strong row(s) dropped as P/k or k*P duplicates "
+              f"of a stronger strong candidate; {len(harmonic_dup_log) - _nd} alias(es) "
+              f"kept (fundamental not strong)")
     # TICs whose eb_host / systematic-veto membership was overridden above by
     # anti-TOI protection — a protected row survived despite the TIC being a
     # deep-systematic/EB host. Used to keep the dossier's "Deep-systematic
@@ -1205,6 +1536,7 @@ def main():
             _mast = _fetch_mast(_surv_missing)
             _nf = 0
             for _tid, _p in _mast.items():
+                mast_stellar_params[_tid] = _p
                 if _p.get("rad") is not None and _tid not in stellar_radii:
                     stellar_radii[_tid] = _p["rad"]
                     _nf += 1
@@ -1243,6 +1575,10 @@ def main():
         if sec is not None and s["depth_ppm"] and sec > 0.3 * s["depth_ppm"] and sec > 300:
             flags.append("secondary")
         s["_eb_flags"] = flags
+        # veto v2 soft tag (dossier annotation only; does not affect layer 3)
+        s["_sys_soft"] = (soft_family(P, t0, sysp, dur, s["depth_ppm"], s["snr"],
+                                      s.get("sector"))
+                          if any(f.get("v2") for f in sysp) else None)
         s["_sec"] = sec
         rows.append(s)
         rep.report(i, message=f"TIC {s['tic_id']}")
@@ -1572,6 +1908,31 @@ def main():
     else:
         print("[anti-toi] TOI catalog empty or missing — cross-match skipped")
 
+    # --- Step 5f: physical sanity (EXONIT_PHYS_SANITY, default ON) ---
+    phys_entries, phys_excluded = None, []
+    if _phys.enabled():
+        _recovered = None
+        if _phys.tglc_corr_enabled():
+            try:
+                _recovered = _lc_load_recovered_keys(con, sorted({s["tic_id"] for s in rows}))
+                if _recovered:
+                    print(f"[phys-sanity] {len(_recovered)} FFI-fallback task key(s) "
+                          f"(tasks.lc_load_recovered): those rows stay uncorrected")
+            except Exception as exc:  # noqa: BLE001 - annotation must never break postprocess
+                print(f"WARNING phys-sanity: tasks.lc_load_recovered lookup failed ({exc!r}); "
+                      f"every row left uncorrected (lc_source_unknown)")
+                _recovered = _phys.RECOVERED_ALL
+        phys_entries, final, phys_excluded = _physical_sanity_step(
+            rows, final, mc, stellar_radii, mast_stellar_params, recovered=_recovered,
+            lot_sector=args.sector)
+        _cnt = {}
+        for _, _r, _ in phys_entries:
+            for _f in _r["flags"]:
+                _cnt[_f] = _cnt.get(_f, 0) + 1
+        print(f"[phys-sanity] {len(phys_entries)} strong row(s); flags: {_cnt or 'none'}; "
+              f"{len(phys_excluded)} finalist(s) excluded (rp_implausible/giant_host_hard): "
+              + (", ".join(f"TIC {t} ({'+'.join(f)})" for t, f in phys_excluded) or "-"))
+
     # --- Step 6: dossier ---
     out = [f"# Discovery vetting dossier — {args.sample}", "",
            f"Strong candidates (v6>{args.v6_min}, post-veto): {len(rows)}.", "",
@@ -1581,10 +1942,18 @@ def main():
         fpp = fpp_res.get(s["tic_id"], {})
         out.append(f"| {s['tic_id']} | {s['period_days']:.2f} | {s['depth_ppm']:.0f} | "
                    f"{s['snr']:.0f} | {s['exominer_ffi_score']:.2f} | "
-                   f"{', '.join(s['_eb_flags']) or 'ok'} | "
+                   f"{', '.join(s['_eb_flags']) or 'ok'}"
+                   f"{' [sys-soft P~%.4g]' % s['_sys_soft']['period'] if s.get('_sys_soft') else ''} | "
                    f"{fpp.get('fpp', '-') if fpp else '-'} | {fpp.get('verdict', '-') if fpp else '-'} |")
     out += ["", f"**Finalists (pass all + FPP<0.5): {len(final)}**: "
-            + (", ".join(s["tic_id"] for s in final) or "none")]
+            + (", ".join(s["tic_id"] for s in final) or "cap")]
+    if harmonic_dedup_on:
+        out += _harmonic_dedup_dossier_lines(harmonic_dup_log)
+    if phys_entries is not None:
+        out += [""] + _phys.dossier_lines(phys_entries, t0_is_centre=_phys.t0_is_centre_env())
+        if phys_excluded:
+            out += ["", "Excluded from finalists (physical sanity): "
+                    + ", ".join(f"{t} ({', '.join(f)})" for t, f in phys_excluded) + "."]
 
     # Shared-signal cross-check (Step 5e). Printed even when it found nothing,
     # so "no duplicates" is a recorded result and not an absent section that
@@ -1720,7 +2089,7 @@ def main():
             f"Deep-systematic veto: {len(eb_hosts)} host-TIC(s) in sample "
             f"({len(eb_with_pc)} with planet_candidate rows); "
             f"excluded from finalists: "
-            + (", ".join(sorted(eb_with_pc_excluded)) if eb_with_pc_excluded else "none")
+            + (", ".join(sorted(eb_with_pc_excluded)) if eb_with_pc_excluded else "cap")
             + f"  (threshold ≥{args.deep_eclipse_ppm:.0f} ppm on systematic period or "
             f"Rp>{MAX_PLANET_RADIUS_RJUP:.1f} R_Jup)"
         )
@@ -1742,6 +2111,9 @@ def main():
 
     Path(args.out).write_text("\n".join(out) + "\n")
     print(f"[dossier] escrit {args.out}")
+    if veto_v2_shadow() and shadow_fams is not None:
+        _veto_v2_shadow_step(con, tics, args, sysp, shadow_fams, toi_protection, stellar_radii,
+                             depth_gate_ids, survivors, final, shadow_meta)
     con.close()
     return 0
 

@@ -6,7 +6,7 @@ locally. (A legacy base64 time/flux task mode existed until 2026-06-09 but
 no production server ever used it.)
 """
 
-# ---- CPU thread cap (CLAUDE.md rule 2: leave at least 25% free) -----------
+# ---- CPU thread cap (project rule 2: leave at least 25% free) -----------
 # Env vars must be set BEFORE numpy / scipy / numba are imported so BLAS and
 # OpenMP pools pick them up. Config is read here with only os + json so we
 # can honor `cpu_threads` before any heavy import runs.
@@ -164,6 +164,7 @@ from pathlib import Path
 
 from fits_cache_helper import ensure_fits_present
 from wotan_detrend import detrend_with_wotan
+from gap_fill import fill_gaps_seeded, DetrendFrame
 # Shared with agent.py's PID-file check (2026-07-02 cleanup review, D13) —
 # see procutil.py for the Windows os.execv SystemError edge-case docstring.
 from procutil import pid_alive as _pid_alive
@@ -201,7 +202,11 @@ def resolve_harmonic(time, flux, result, period_min, period_max, bls_fn,
                      data_source: str = "spoc",
                      long_period_recovery: bool = False,
                      long_period_min_days: float = 10.0,
-                     long_snr_factor: float = 0.5):
+                     long_snr_factor: float = 0.5,
+                     epoch_class: bool = False,
+                     excluded=None,
+                     trace=None,
+                     veto_mode: str = "vh"):
     """Symmetric harmonic resolver (audit §76-85).
 
     Given a seed BLS ``result`` at period P, probe the harmonic
@@ -231,7 +236,38 @@ def resolve_harmonic(time, flux, result, period_min, period_max, bls_fn,
         Minimum SNR for a candidate to qualify.
     depth_ratio_lo, depth_ratio_hi : float
         Open interval (lo, hi) for the candidate-to-seed depth ratio.
+    epoch_class : bool
+        Config flag ``harmonic_epoch_class`` (default off = bit-identical).
+        When on: (a) the seed is first promoted to k*P by the epoch-class
+        parity test (harmonic_epoch_class.promote_epoch_class), guarded by G1
+        (a re-fit at k*P is rejected when all k classes carry at P_k/k); a
+        promotion is returned as-is (no further probes), otherwise the usual
+        probes run; (b) a ``/k`` demotion probe is vetoed per ``veto_mode``
+        (see harmonic_epoch_class.demotion_supported for the vh rule and its
+        derivation: "v0" unless every class carries on baselines where the
+        probe grid is finer than the BLS peak, "v1" = only positive alias
+        evidence when span * 2e-4 > duration).
+    excluded : np.ndarray[bool] or None
+        Points the multi-planet loop filled after masking an earlier transit
+        (``accumulated_mask``); the epoch-class code ignores them. Unused when
+        ``epoch_class`` is off.
+    veto_mode : str
+        Demotion-veto mode; NOT read from the task config (one mode on the
+        whole fleet). Only the A/B harness passes anything but "vh".
+    trace : list or None
+        Optional out-list; the epoch-class promotion appends one dict per
+        decision (promote / reject with reason).
     """
+    if epoch_class:
+        promoted = promote_epoch_class(time, flux, result, period_max, bls_fn,
+                                       snr_min=snr_min, excluded=excluded,
+                                       trace=trace)
+        if promoted is not result:
+            # Parity evidence is final: do NOT run the amplitude probes from
+            # the promoted seed. Its re-fit SNR is a narrow-window SDE (not
+            # comparable to a full-range seed SDE), so the usual /k probes
+            # would out-"SNR" and undo the promotion.
+            return promoted
     base_period = result["period"]
     base_depth = result.get("depth", 0.0)
 
@@ -338,6 +374,19 @@ def resolve_harmonic(time, flux, result, period_min, period_max, bls_fn,
         if guard and span > 0 and sub.get("period", 0.0) > 0 \
                 and span / sub["period"] < 2.0:
             continue
+        # Demotion veto (epoch_class only): a /k probe whose own epoch classes
+        # show the one-class-carries / others-flat pattern is a spurious
+        # sub-harmonic (see demotion_supported for the modes).
+        if epoch_class and label.startswith("/") \
+                and not demotion_supported(time, flux, sub, int(label[1:]),
+                                           excluded=excluded,
+                                           mode=veto_mode):
+            if trace is not None:
+                trace.append({"pass": -1, "k": int(label[1:]),
+                              "action": "veto",
+                              "reason": "demotion_probe_veto_" + veto_mode,
+                              "period": float(sub.get("period", 0.0))})
+            continue
         # First qualifying probe wins.
         return sub
     return result
@@ -397,6 +446,8 @@ from bls import run_bls, get_backend_name as _bls_backend, get_gpu_info as _bls_
 from bls_fast import bls_fast, bls_two_pass, HAS_NUMBA as _has_numba
 from vetting import vet_candidate
 from duration_refine import apply_duration_refine, merge_same_period_candidates
+from harmonic_epoch_class import (promote_epoch_class, demotion_supported,
+                                  slot_duplicate)
 from cnn import TransitClassifier
 try:
     from cnn_ffi import FFITransitClassifier
@@ -423,6 +474,72 @@ def _detect_data_source(local_paths) -> str:
     if has_ffi and not has_spoc:
         return "ffi"
     return "spoc"
+
+
+def _detect_lc_source(local_paths) -> str:
+    """Light-curve PRODUCT of the files a star was stitched from: 'spoc' / 'tglc' / 'qlp' / 'mixed' / 'unknown'.
+
+    `_detect_data_source` lumps QLP and TGLC together as "ffi" (right for the CNN routing, wrong for the FPP: the two products
+    have different flux definitions, apertures and dilution conventions, plan D8).  Same name patterns as
+    exonit.physical_sanity.lc_source_from_fits_files (the server's `lc_source` of the FPP task); never guessed:
+    any file of another pattern makes the answer 'unknown'.
+    """
+    kinds = set()
+    for p in local_paths or ():
+        b = os.path.basename(str(p)).lower()
+        if b.startswith("hlsp_tglc"):
+            kinds.add("tglc")
+        elif b.startswith("hlsp_qlp"):
+            kinds.add("qlp")
+        elif b.endswith("_lc.fits") and "hlsp" not in b:
+            kinds.add("spoc")
+        else:
+            return "unknown"
+    if not kinds:
+        return "unknown"
+    return kinds.pop() if len(kinds) == 1 else "mixed"
+
+
+#: Epoch convention of a STORED candidate row (period_days / t0 / duration_days as posted to and read back from the DB).
+#: Every stored t0 is the raw BLS box START: duration_refine (the only code returning the centre) is OFF fleet-wide and
+#: the DB carries no per-row marker (exonit/physical_sanity.py "T0 conventions").  Both FPP paths (in-task and backfill)
+#: fold from the stored row with this convention, so the same DB row gives the same FPP on either path and the fold can
+#: be rebuilt from the DB (review round 1, R1).  A task may override it with an explicit, valid "t0_convention".
+#: Before duration_refine is turned on this constant must become a per-row marker (report section 5.4).
+STORED_T0_CONVENTION = "box_start"
+
+
+def _stored_t0_convention(task):
+    conv = task.get("t0_convention") if isinstance(task, dict) else None
+    return conv if conv in ("box_start", "centre") else STORED_T0_CONVENTION
+
+
+def _fpp_ephem_log(res):
+    """Log suffix with the fold-ephemeris provenance of an FPP result.  The ephem_* fields are posted (the model-field whitelist)
+    and stored by the server where scripts/migration/2026-10-30_fpp_ephem_columns.sql
+    is applied; the flag `ephem_refine_failed` also travels in fpp_flags."""
+    if not isinstance(res, dict) or "ephem_status" not in res:
+        return ""
+    return (f" ephem={res['ephem_status']} P={res.get('ephem_P', float('nan')):.7f}"
+            f" t0={res.get('ephem_t0', float('nan')):.5f} shift={res.get('ephem_shift_h', 0.0):+.2f}h")
+
+
+def _fpp_extra_kwargs(lc_source, task=None, *, t0_convention):
+    """Keyword arguments of the FPP call that carry the light-curve PRODUCT (dilution convention, depth scale, product aperture).
+
+    Only the native engine accepts them (`calc_fpp_by_source` needs `lc_source`); the legacy triceratops_fpp fallback takes none.
+    `lc_source` None / unrecognised = 'unknown' (both conventions, higher FPP, never validated).  The task's `geometry`, `cadence_s`
+    and population are NOT forwarded here: that plumbing belongs to the task-input helper of the D/B-family change
+    (`_fpp_population_kwargs`, branch ext-db-family), and passing `geometry` from both places would be a duplicate keyword.
+    `t0_convention` (required keyword, no default: calc_fpp_by_source needs it explicit, fpp_native section 8b) is the
+    epoch convention of the period / t0 passed with it; the worker passes `_stored_t0_convention(task)` on both paths.
+    """
+    if not _FPP_NATIVE:
+        return {}
+    kw = {"lc_source": lc_source if lc_source else "unknown", "t0_convention": t0_convention}
+    if isinstance(task, dict) and task.get("tglc_near_edge") is not None:
+        kw["tglc_near_edge"] = bool(task["tglc_near_edge"])
+    return kw
 
 
 def _read_lightcurve(path):
@@ -458,15 +575,162 @@ from injection import run_injection_recovery
 
 # FPP: prefer fpp_native (no triceratops/pytransit dependency)
 _triceratops_available = False
+_FPP_NATIVE = False
 
 class FPPAborted(Exception):
     """Fallback definition if fpp_native not available."""
     pass
 
+
+class FPPUnavailable(RuntimeError):
+    """Fallback definition if fpp_native is not available."""
+    skip_reason = None
+
+
+def _population_provenance_missing(task):
+    """True when a task's background population lacks its sha256/version provenance.
+
+    Mirrors fpp_native.population_provenance_missing (kept local so the check works
+    before/without the native import). Such a task is refused with
+    ``population_invalid`` (the Swift port's reason) and never computed.
+    """
+    sha, version = task.get("population_sha256"), task.get("population_version")
+    return not (isinstance(sha, str) and sha and isinstance(version, str) and version)
+
+
+_fpp_native_enabled = False
+_FPP_RESULT_MODEL_FIELDS = (
+    "fpp_model_version", "fpp_scen", "fpp_backend", "fpp_backend_device",
+    "fpp_mc_se", "fpp_n_draws", "population_version", "fpp_flags",
+    "population_source", "population_sha256",
+    # model >= 3: what convention / geometry / scale produced the number (stored by the server)
+    "geometry_version", "dilution_convention", "aperture_source", "depth_scale",
+    # step 7 Monte-Carlo noise fields
+    "nfpp_mc_se", "fpp_n_draws_total", "mc_min_ess", "mc_borderline", "mc_detail",
+    # ephemeris refinement provenance (FPP_EPHEM_REFINE); same keys as the Rust / Swift result DTOs
+    # (exonit-core dto.rs, WorkerProtocolDTO.swift). Absent when the switch is off (the engine adds nothing).
+    "ephem_refined", "ephem_status", "ephem_t0_convention", "ephem_P", "ephem_t0", "ephem_shift_h",
+    "ephem_refine", "ephem_refine_failed",
+    # D17: the switch set used for THIS computation (fpp_native result["fpp_switches"] = get_fpp_switches())
+    "fpp_switches",
+)
+
+#: mc_detail is stored as JSONB; the server rejects a body whose serialisation is
+#: bigger than this (same cap it applies itself), so trim it here instead of losing
+#: the whole result to an HTTP 400.
+_MC_DETAIL_MAX_BYTES = 64 * 1024
+
+
+def _fpp_result_model_fields(result):
+    """Map one engine result (fpp_native) to the keys the server accepts. Pure: never mutates result."""
+    out = {}
+    for key in _FPP_RESULT_MODEL_FIELDS:
+        if key in result:
+            out[key] = result[key]
+    # The engine names its draw counters differently from the model columns.
+    if result.get("n_draws_final") is not None and out.get("fpp_n_draws") is None:
+        out["fpp_n_draws"] = result["n_draws_final"]
+    if result.get("n_draws_total") is not None:
+        out["fpp_n_draws_total"] = result["n_draws_total"]
+    # borderline only means anything when the MC policy actually ran.
+    if result.get("mc_policy") and result.get("borderline") is not None:
+        out["mc_borderline"] = bool(result["borderline"])
+    detail = {}
+    if result.get("refinement_stages") is not None:
+        detail["stages"] = result["refinement_stages"]
+    if result.get("borderline_reasons") is not None:
+        detail["borderline_reasons"] = list(result["borderline_reasons"])
+    if result.get("mc_min_ess_scenario") is not None:
+        detail["min_ess_scenario"] = result["mc_min_ess_scenario"]
+    if result.get("n_draws_all_runs") is not None:
+        detail["n_draws_all_runs"] = result["n_draws_all_runs"]
+    if result.get("mc_scen") is not None:
+        detail["mc_scen"] = result["mc_scen"]
+    # fpp_unstable honesty flag (FPP_UNSTABLE_FLAG): the dominant-scenario ESS and the FPP tail-box interval ride in mc_detail
+    # (JSONB), so no new column is needed
+    for src, dst in (("mc_ess_dom", "ess_dom"), ("mc_dominant_scenario", "dominant_scenario"), ("fpp_interval", "fpp_interval")):
+        if src in result:
+            detail[dst] = result[src]
+    if detail:
+        out["mc_detail"] = detail
+
+    def _json_safe(value):
+        """Copy of *value* with every non-finite float replaced by None: JSON has no
+        NaN/Infinity, so one NaN anywhere in mc_detail makes the server reject the
+        whole result with 400 and the FPP would be lost."""
+        if isinstance(value, dict):
+            return {k: _json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_json_safe(v) for v in value]
+        if hasattr(value, "item") and not isinstance(value, (float, int, str, dict, list)):
+            value = value.item()                                    # numpy scalar
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        return value
+
+    if "mc_detail" in out:
+        out["mc_detail"] = _json_safe(out["mc_detail"])
+    if "ephem_refine" in out:
+        out["ephem_refine"] = _json_safe(out["ephem_refine"])
+    sw = out.get("fpp_switches")
+    if sw is not None:
+        # the server accepts a flat {str: str} only; anything else is dropped (honest "not reported") instead of 400-ing the result
+        if isinstance(sw, dict) and sw and all(isinstance(k, str) and isinstance(v, str) for k, v in sw.items()):
+            out["fpp_switches"] = dict(sw)
+        else:
+            del out["fpp_switches"]
+    for key in ("ephem_P", "ephem_t0", "ephem_shift_h"):
+        value = out.get(key)
+        if hasattr(value, "item") and not isinstance(value, (float, int)):
+            value = out[key] = value.item()
+        if isinstance(value, float) and not math.isfinite(value):
+            del out[key]
+    # A NaN/inf top-level number is dropped rather than sanitised to None: the server
+    # would 400 on it, and "no value" is the honest answer.
+    for key in ("fpp_mc_se", "nfpp_mc_se", "mc_min_ess"):
+        value = out.get(key)
+        if isinstance(value, float) and not math.isfinite(value):
+            del out[key]
+
+    detail = out.get("mc_detail")
+    if isinstance(detail, dict):
+        def _too_big(d):
+            try:
+                text = json.dumps(d, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            except ValueError:
+                return True
+            return len(text.encode("utf-8")) > _MC_DETAIL_MAX_BYTES
+
+        if _too_big(detail):
+            detail.pop("mc_scen", None)                             # biggest payload first
+            detail["truncated"] = True
+            if _too_big(detail):
+                for stage in detail.get("stages") or []:
+                    if isinstance(stage, dict):
+                        stage.pop("top_scenarios", None)
+                if _too_big(detail):
+                    logging.getLogger("exonit").warning(
+                        "mc_detail still over %d bytes after trimming — the server will reject it",
+                        _MC_DETAIL_MAX_BYTES)
+    return out
+
+
 try:
-    from fpp_native import calc_fpp_native as calc_fpp, should_run_triceratops
-    from fpp_native import FPPAborted  # override fallback with real class
+    # calc_fpp_by_source: the dilution convention / depth scale / aperture follow the light-curve product (plan D8)
+    from fpp_native import calc_fpp_by_source as calc_fpp, should_run_triceratops
+    _FPP_NATIVE = True
+    from fpp_native import FPPAborted, FPPUnavailable  # override fallbacks
+    import fpp_native as _fpp_native_mod
     _triceratops_available = True
+    _fpp_native_enabled = True
+    if _fpp_native_mod.GL_TABLES_ERROR:
+        # Missing / corrupt fpp_gl_tables.json (e.g. a half-applied auto-update): FPP is UNAVAILABLE on this host.
+        # No fallback to the legacy model, no computation without the table; the FPP pools are not entered, so the
+        # work stays queued for hosts that have it.
+        _triceratops_available = False
+        logging.getLogger("exonit").error(
+            "NO FPP BACKEND AVAILABLE: %s — FPP is disabled on this worker (tasks stay queued)",
+            _fpp_native_mod.GL_TABLES_ERROR)
 except ImportError as _fpp_e:
     logging.getLogger("exonit").warning(
         "fpp_native unavailable (%s) — trying legacy triceratops_fpp", _fpp_e)
@@ -557,7 +821,7 @@ def _resolve_git_sha() -> str:
     return sha
 
 
-def _resolve_flag_states(config: dict) -> dict:
+def _resolve_flag_states(config: dict, effective_harmonic_epoch_class=None) -> dict:
     """Snapshot of feature-flag values the heartbeat should publish so farmctl
     status can show what each worker has enabled. Add new flags here as they
     are introduced — keep the dict small (these go in every heartbeat)."""
@@ -568,8 +832,15 @@ def _resolve_flag_states(config: dict) -> dict:
         "gpu_enabled",
         "run_injection",
         "run_fpp",
+        "gap_fill_detrend_only",
     )
-    return {k: config.get(k) for k in keys if k in config}
+    states = {k: config.get(k) for k in keys if k in config}
+    # harmonic_epoch_class is dispatched per task by the server (task value > local config >
+    # off): report the value the last task ACTUALLY ran with, never the local config; absent
+    # until the first task has been processed.
+    if effective_harmonic_epoch_class is not None:
+        states["harmonic_epoch_class"] = bool(effective_harmonic_epoch_class)
+    return states
 
 
 # ---------------------------------------------------------------------------
@@ -938,7 +1209,7 @@ class ExoNitWorker:
         # repeated `nohup python worker.py` or schtasks /Run create
         # zombie processes that share the worker_name and fight for
         # tasks/CPU (observed <host> 3-process zombie on 2026-04-21:
-        # each TIC took 3× longer due to contention; see CLAUDE.md
+        # each TIC took 3× longer due to contention; see project
         # rule 2 "leave 25% CPU free" — zombies burn 300% instead).
         self._acquire_pid_lock(config_path)
         self.started_at = time.time()
@@ -1844,7 +2115,10 @@ class ExoNitWorker:
             "uptime_s": round(time.time() - self.started_at, 1),
             "pid": os.getpid(),
             "git_sha": _resolve_git_sha(),
-            "flag_states": _resolve_flag_states(self.config),
+            "flag_states": _resolve_flag_states(
+                self.config,
+                effective_harmonic_epoch_class=getattr(
+                    self, "_effective_harmonic_epoch_class", None)),
         }
         # GPU->CPU fallback counters (2026-07-14). A worker quietly finishing a
         # run on the CPU is the state project rule 2 forbids, and the only
@@ -2198,7 +2472,7 @@ class ExoNitWorker:
             self.logger.warning(f"Error getting task: {e}")
             return None
 
-    def _load_star(self, tic_id):
+    def _load_star(self, tic_id, gap_fill_detrend_only=False):
         """Fetch metadata + FITS from server, read with lightkurve, return arrays.
 
         Returns
@@ -2208,6 +2482,13 @@ class ExoNitWorker:
             the wotan detrending — needed by the multi-planet loop to
             re-detrend with an accumulated transit mask (Hippke+ 2019 §5).
             On failure: (None, None, None, 0, {}).
+
+        ``gap_fill_detrend_only`` (task config, default False = bit-identical
+        legacy path): gap-fill points are used only by the detrender and then
+        dropped, so the returned arrays hold real cadences only. When points
+        were dropped, ``meta["_detrend_frame"]`` carries a
+        ``gap_fill.DetrendFrame`` (full real+synthetic series) that every later
+        re-detrend must use instead of ``detrend_with_wotan(time, raw_flux)``.
         """
         # 1. Fetch metadata
         try:
@@ -2310,6 +2591,7 @@ class ExoNitWorker:
             # Fill small gaps (within sectors) to prevent detrend edge effects
             # Do NOT fill large gaps (between sectors separated by months/years)
             # as this creates millions of filler points that dilute transit signals
+            synthetic = None  # gap_fill_detrend_only: True = gap-fill point
             try:
                 max_gap_days = 5  # only fill gaps < 5 days
                 time_vals = lc.time.value
@@ -2317,7 +2599,13 @@ class ExoNitWorker:
                     gaps = np.diff(time_vals)
                     max_actual_gap = np.max(gaps)
                     if max_actual_gap < max_gap_days:
-                        lc = lc.fill_gaps()
+                        # Deterministic (seeded by tic+sectors): lightkurve's own
+                        # fill_gaps uses the unseeded global RNG -> non-reproducible.
+                        if gap_fill_detrend_only:
+                            lc, synthetic = fill_gaps_seeded(
+                                lc, tic_id, sectors, return_synthetic=True)
+                        else:
+                            lc = fill_gaps_seeded(lc, tic_id, sectors)
                     else:
                         self.logger.info(f"Skipping fill_gaps: max gap={max_actual_gap:.0f}d > {max_gap_days}d")
             except (ValueError, Exception):
@@ -2332,6 +2620,12 @@ class ExoNitWorker:
             # multi-planet BLS loop can re-detrend with an accumulated transit mask
             # (Hippke+ 2019 §5).
             raw_flux_arr = f_raw.copy()
+            # gap_fill_detrend_only: synthetic points stay in every wotan call
+            # (they bridge the gaps) but never reach a BLS, and transit masks
+            # only cover real points. None = legacy path (flag off or no fill).
+            synth = None
+            if synthetic is not None and np.any(synthetic):
+                synth = np.asarray(synthetic, dtype=bool)
             finite_mask = np.isfinite(t_raw) & np.isfinite(f_raw)
             flat_flux = np.full_like(f_raw, np.nan)
             flat_flux[finite_mask] = detrend_with_wotan(
@@ -2342,6 +2636,8 @@ class ExoNitWorker:
             # them (wotan preserves full depth with explicit mask).
             try:
                 m = np.isfinite(t_raw) & np.isfinite(flat_flux)
+                if synth is not None:
+                    m &= ~synth
                 quick_result = bls_fast(t_raw[m], flat_flux[m],
                     period_min=0.5, period_max=50.0, n_periods=2000,
                     n_bins=100, n_dur_steps=5)
@@ -2349,6 +2645,8 @@ class ExoNitWorker:
                     phase = ((t_raw - quick_result["t0"]) % quick_result["period"]) / quick_result["period"]
                     half_dur = (quick_result["duration"] / quick_result["period"])  # 2× duration
                     transit_mask = (phase < half_dur) | (phase > 1.0 - half_dur)
+                    if synth is not None:
+                        transit_mask &= ~synth
                     # Re-detrend with transit points explicitly masked
                     flat_flux[finite_mask] = detrend_with_wotan(
                         t_raw[finite_mask], f_raw[finite_mask],
@@ -2360,7 +2658,7 @@ class ExoNitWorker:
             time_arr = t_raw
             flux_arr = flat_flux
             # PDCSAP is already ~1.0; only re-normalize if way off
-            median = np.nanmedian(flux_arr)
+            median = np.nanmedian(flux_arr if synth is None else flux_arr[~synth])
             if median > 1.5 or median < 0.5:
                 flux_arr = flux_arr / median
 
@@ -2369,6 +2667,8 @@ class ExoNitWorker:
             time_arr = time_arr[sort_idx]
             flux_arr = flux_arr[sort_idx]
             raw_flux_arr = raw_flux_arr[sort_idx]
+            if synth is not None:
+                synth = synth[sort_idx]
 
             # Remove NaN/inf across all three arrays so downstream callers
             # (BLS, multi-planet re-detrend) get fully-finite, index-aligned data.
@@ -2379,8 +2679,24 @@ class ExoNitWorker:
             flux_arr = flux_arr[mask]
             raw_flux_arr = raw_flux_arr[mask]
 
+            # gap_fill_detrend_only: keep the full series for later re-detrends
+            # (DetrendFrame), then drop the synthetic points from everything
+            # downstream (BLS, vetting, multi-planet loop, CNN, injection).
+            if synth is not None:
+                synth = synth[mask]
+                frame = DetrendFrame(time_arr, raw_flux_arr, synth)
+                real = ~synth
+                time_arr = time_arr[real]
+                flux_arr = flux_arr[real]
+                raw_flux_arr = raw_flux_arr[real]
+                meta["_detrend_frame"] = frame
+                self.logger.info(
+                    f"gap_fill_detrend_only: dropped {frame.n_synthetic} "
+                    f"gap-fill points after detrend")
+
             # Tag data source (spoc vs ffi) so the CNN routing can pick the right model.
             meta["data_source"] = _detect_data_source(local_paths)
+            meta["lc_source"] = _detect_lc_source(local_paths)       # product for the FPP: spoc / tglc / qlp / mixed
             self.logger.info(f"Loaded TIC {tic_id}: {len(time_arr)} points, {len(sectors)} sectors, "
                   f"{time_arr[-1]-time_arr[0]:.1f} days, source={meta['data_source']}")
             return time_arr, flux_arr, raw_flux_arr, len(sectors), meta
@@ -2425,6 +2741,7 @@ class ExoNitWorker:
         # Best-effort metadata refetch (5 s timeout). RA/Dec/Tmag may end up
         # None; downstream code tolerates this (UI formatter, FPP skip path).
         meta = {"tic_id": str(tic_id), "data_source": "ffi",
+                "lc_source": "unknown",         # the server's Phase 2.5 FFI product: convention unverifiable
                 "lc_load_recovered": True,
                 "ra": None, "dec": None, "tmag": None, "sectors": []}
         try:
@@ -2445,6 +2762,33 @@ class ExoNitWorker:
             "(%d sectors, %d points, source=ffi)",
             tic_id, reason, n_sectors, len(time_arr))
         return time_arr, flux_arr, raw_flux_arr, n_sectors, meta
+
+    def _gap_fill_detrend_only_enabled(self, task_config=None):
+        """``gap_fill_detrend_only`` precedence: task config if the key is
+        present, else the worker config, else False. The FPP backfill has no
+        task config, so the worker key is what makes in-task FPP and backfill
+        FPP see the same light curve (gap_fill.py module docstring).
+
+        Only real JSON bools count (identical to the Rust ``config_bool`` /
+        ``WorkerConfig`` and Swift ``JSONValue.bool`` / ``WorkerConfig``
+        readers): a non-bool task value ("true", "false", 1, 0, null) is
+        ignored with a warning and the worker value applies; a non-bool
+        worker value is ignored with a warning and counts as False."""
+        key = "gap_fill_detrend_only"
+        log = getattr(self, "logger", None) or logging.getLogger("exonit")
+        worker_cfg = getattr(self, "config", None) or {}
+        worker_value = worker_cfg.get(key, False)
+        if not isinstance(worker_value, bool):
+            log.warning(f"worker config {key}={worker_value!r} is not a JSON "
+                        f"bool; ignored (off)")
+            worker_value = False
+        if isinstance(task_config, dict) and key in task_config:
+            task_value = task_config[key]
+            if isinstance(task_value, bool):
+                return task_value
+            log.warning(f"task config {key}={task_value!r} is not a JSON bool; "
+                        f"ignored (worker value {worker_value})")
+        return worker_value
 
     def _base_result(self, task):
         """Common /api/worker/result skeleton shared by the success path
@@ -2497,7 +2841,10 @@ class ExoNitWorker:
 
     def process_task(self, task):
         tic_id = task["tic_id"]
-        config = task.get("config", {})
+        # "config": null (or a non-object) in a poll response == absent.
+        config = task.get("config")
+        if not isinstance(config, dict):
+            config = {}
         # Local worker config can override task-level knobs. Used e.g. to
         # disable run_injection on hosts where Numba's workqueue layer is
         # not thread-safe (M1 macOS crashes when Injection CPU runs in a
@@ -2508,6 +2855,22 @@ class ExoNitWorker:
                     "cross_source_enabled"):
             if key in self.config:
                 config[key] = self.config[key]
+        # Alias phase-2 flag: precedence server task config > local worker
+        # config > off. The server always sends a bool when it dispatches
+        # the flag (EXONIT_HARMONIC_EPOCH_CLASS); an old server sends nothing
+        # and the local config (default off) applies. A non-bool value is a
+        # protocol error: warn and fall back to the local default, never
+        # truthy-coerce a string such as "false".
+        _hec = config.get("harmonic_epoch_class")
+        if _hec is not None and not isinstance(_hec, bool):
+            self.logger.warning(
+                f"task config harmonic_epoch_class={_hec!r} is not a bool; "
+                f"ignored, using local config")
+            _hec = None
+        if _hec is None:
+            _hec = self.config.get("harmonic_epoch_class", False)
+        config["harmonic_epoch_class"] = _hec is True
+        self._effective_harmonic_epoch_class = config["harmonic_epoch_class"]
         self.status = "working"
         self.current_tic = tic_id
         self.logger.info(f"Processing TIC {tic_id}...")
@@ -2522,7 +2885,21 @@ class ExoNitWorker:
         self.current_phase = "load"
         t_phase = time.time()
         # raw_flux_arr: consumed by multi-planet re-detrend loop (Task 3).
-        time_arr, flux_arr, raw_flux_arr, n_sectors, star_meta = self._load_star(tic_id)
+        # gap_fill_detrend_only (default off): gap-fill points only feed the
+        # detrender; the arrays returned here are real cadences only, and the
+        # re-detrends below go through ``detrend_frame`` (see gap_fill.py).
+        # Synthetic points are never transit-masked there -- the one
+        # deliberate deviation from flag OFF; the 30 % coverage gate counts
+        # real points only.
+        # Precedence task config > worker config > off. The kwarg is only
+        # passed when ON so the flag-off call stays exactly
+        # ``_load_star(tic_id)`` (legacy signature used by test doubles).
+        load_kwargs = ({"gap_fill_detrend_only": True}
+                       if self._gap_fill_detrend_only_enabled(config) else {})
+        time_arr, flux_arr, raw_flux_arr, n_sectors, star_meta = self._load_star(
+            tic_id, **load_kwargs)
+        detrend_frame = (star_meta.pop("_detrend_frame", None)
+                         if isinstance(star_meta, dict) else None)
         if time_arr is None:
             elapsed = time.time() - t_start
             self.logger.warning(f"TIC {tic_id}: failed to load data ({elapsed:.1f}s)")
@@ -2618,10 +2995,15 @@ class ExoNitWorker:
                     )
                 else:
                     try:
-                        redetrended = detrend_with_wotan(
-                            time_arr, raw_flux_arr,
-                            transit_mask=accumulated_mask,
-                        )
+                        if detrend_frame is not None:
+                            redetrended = detrend_frame.detrend(
+                                detrend_with_wotan,
+                                transit_mask=accumulated_mask)
+                        else:
+                            redetrended = detrend_with_wotan(
+                                time_arr, raw_flux_arr,
+                                transit_mask=accumulated_mask,
+                            )
                         # wotan's flat_flux keeps in-transit samples (the mask
                         # only steers the trend fit). Without suppressing prior
                         # transits BLS re-finds the same signal every iteration
@@ -2680,6 +3062,7 @@ class ExoNitWorker:
 
             # Symmetric harmonic resolution (audit §76-85).
             seed_period = result["period"]
+            harm_trace = []
             result = resolve_harmonic(
                 time_arr, current_flux, result,
                 period_min=period_min,
@@ -2692,7 +3075,15 @@ class ExoNitWorker:
                     "harmonic_long_period_min_days", 10.0),
                 long_snr_factor=config.get(
                     "harmonic_long_snr_factor", 0.5),
+                epoch_class=bool(config.get("harmonic_epoch_class", False)),
+                excluded=accumulated_mask,
+                trace=harm_trace,
             )
+            for tr in harm_trace:
+                self.logger.info(
+                    f"Harmonic epoch-class: seed P={seed_period:.4f}d "
+                    f"k={tr['k']} {tr['action']} ({tr['reason']}) "
+                    f"P={tr['period']:.4f}d")
             if abs(result["period"] - seed_period) / max(seed_period, 1e-9) > 0.01:
                 self.logger.info(
                     f"Harmonic: P={seed_period:.4f}d -> "
@@ -2825,6 +3216,21 @@ class ExoNitWorker:
                         rm_p > 0 and abs(rm_p - c["period_days"])
                         / max(c["period_days"], 1e-9) < 0.02
                         for c in candidates)
+                    # Epoch-coincident P/k or k*P of an accepted candidate is
+                    # the same signal; parity decides which side is the alias
+                    # (config-gated, default off).
+                    if (not already and rm_p > 0
+                            and config.get("harmonic_epoch_class", False)):
+                        # Parity needs the accepted candidates' OWN transits:
+                        # use the pre-loop detrended flux (flux_arr), not
+                        # current_flux/accumulated_mask in which they are
+                        # masked and median-filled (-> always 'undecided').
+                        already = slot_duplicate(
+                            time_arr, flux_arr, rm_p, rm["t0"],
+                            rm["duration"], candidates,
+                            excluded=None,
+                            t0_is_centre=bool(
+                                config.get("duration_refine", False)))
                     t14m = physical_t14_max(
                         rm_p, star_meta.get("stellar_radius"),
                         star_meta.get("stellar_mass"))
@@ -2913,12 +3319,19 @@ class ExoNitWorker:
                 best_window = None
                 for long_window in long_windows:
                     long_window = float(long_window)
-                    flat_long = detrend_with_wotan(
-                        time_arr, raw_flux_arr,
-                        window_length=long_window,
-                        transit_mask=(accumulated_mask
-                                      if accumulated_mask.any() else None),
-                    )
+                    long_mask = (accumulated_mask
+                                 if accumulated_mask.any() else None)
+                    if detrend_frame is not None:
+                        flat_long = detrend_frame.detrend(
+                            detrend_with_wotan,
+                            window_length=long_window,
+                            transit_mask=long_mask)
+                    else:
+                        flat_long = detrend_with_wotan(
+                            time_arr, raw_flux_arr,
+                            window_length=long_window,
+                            transit_mask=long_mask,
+                        )
                     bad = ~np.isfinite(flat_long) | accumulated_mask
                     good = ~bad
                     fill_val = (float(np.nanmedian(flat_long[good]))
@@ -3174,8 +3587,30 @@ class ExoNitWorker:
                 if self.ui:
                     self.ui.phase_update(done_count / len(fpp_eligible),
                         f"FPP #{c['candidate_num']}/{len(fpp_eligible)}".ljust(20))
+                fpp_task_inputs = {**task, **c}
+                if (_fpp_native_enabled
+                        and (fpp_task_inputs.get("population") is None
+                             or fpp_task_inputs.get("population_missing", False))):
+                    # Primary per-star tasks currently do not carry this
+                    # input. Leave FPP unset for the population-bearing
+                    # backfill task instead of running without D/B scenarios.
+                    self.logger.info(
+                        "TRICERATOPS #%s deferred to FPP backfill: "
+                        "background population missing",
+                        c.get("candidate_num"))
+                    continue
+                if (_fpp_native_enabled
+                        and _population_provenance_missing(fpp_task_inputs)):
+                    # Unverifiable population (no sha256/version): refuse, same
+                    # reason as the Swift port; the backfill claim re-checks it.
+                    self.logger.warning(
+                        "TRICERATOPS #%s refused (population_invalid): "
+                        "population provenance missing; deferred to FPP backfill",
+                        c.get("candidate_num"))
+                    continue
                 try:
                     sectors_arr = np.arange(1, n_sectors + 1)
+                    # the STORED (rounded) row, exactly as the backfill path reads it back from the DB (R1)
                     fpp = calc_fpp(
                         tic_id, c["period_days"], c["t0"],
                         c["duration_days"], c["depth_ppm"],
@@ -3183,19 +3618,29 @@ class ExoNitWorker:
                         workdir=config.get("cache_dir", "."),
                         server_url=self.server, token=self.token,
                         abort_check=lambda: not self.running,
-                        force_cpu=fpp_force_cpu)
+                        force_cpu=fpp_force_cpu,
+                        **self._fpp_population_kwargs(fpp_task_inputs),
+                        **_fpp_extra_kwargs(
+                            star_meta.get("lc_source") if isinstance(star_meta, dict) else None,
+                            t0_convention=_stored_t0_convention(fpp_task_inputs)))
                     if fpp:
                         fpp_results[i] = fpp
                         c["triceratops_fpp"] = fpp["fpp"]
                         c["triceratops_nfpp"] = fpp.get("nfpp")
                         c["triceratops_prob_planet"] = fpp.get("prob_planet")
                         c["triceratops_verdict"] = fpp["verdict"]
-                        self.logger.info(f"TRICERATOPS #{c['candidate_num']}: FPP={fpp['fpp']:.4f} NFPP={fpp.get('nfpp', -1):.4f} ({fpp['verdict']})")
+                        c.update(_fpp_result_model_fields(fpp))
+                        self.logger.info(f"TRICERATOPS #{c['candidate_num']}: FPP={fpp['fpp']:.4f} NFPP={fpp.get('nfpp', -1):.4f} ({fpp['verdict']}){_fpp_ephem_log(fpp)}")
                         if self.ui: self.ui.fpp_scenario_done(f"#{c['candidate_num']}")
                 except FPPAborted:
                     self.logger.info(f"FPP aborted by user")
                     self.last_error = f"{time.strftime('%H:%M:%S')} FPPAborted: aborted by user"
                     break
+                except FPPUnavailable:
+                    # Invalid population data is an unavailable FPP, not a
+                    # failed score. Let the primary task's existing
+                    # failed/requeue path handle this candidate.
+                    raise
                 except Exception as e:
                     self.logger.warning(f"TRICERATOPS #{c['candidate_num']} failed: {e}")
                 if self.ui:
@@ -3441,6 +3886,10 @@ class ExoNitWorker:
             "tmag": star_meta.get("tmag"),
             "timings": timings,
             "lc_load_recovered": lc_load_recovered,
+            # Provenance: the effective alias phase-2 flag this result was
+            # computed with; the server stores it per candidate
+            # (candidates.harmonic_epoch_class, DDL 2026-11-02).
+            "harmonic_epoch_class": bool(config.get("harmonic_epoch_class", False)),
         })
         return result
 
@@ -3527,6 +3976,48 @@ class ExoNitWorker:
         self.status = "idle"
         self.current_tic = None
 
+    @staticmethod
+    def _fpp_population_kwargs(task):
+        """Return population inputs for the native implementation only.
+
+        Legacy TRICERATOPS predates these keywords and keeps its old call
+        signature. The population is a task-payload value; workers never
+        fetch it themselves.
+        """
+        if not _fpp_native_enabled:
+            return {}
+        return {
+            "cadence_s": task.get("cadence_s"),
+            "geometry": task.get("geometry"),
+            "population": task.get("population"),
+            "population_sha256": task.get("population_sha256"),
+            "population_version": task.get("population_version"),
+            "population_crosscheck": task.get("population_crosscheck"),
+        }
+
+    def _release_fpp_unavailable(self, task, error):
+        """Ask the server to release this assignment without writing a score."""
+        try:
+            response = requests.post(
+                f"{self.server}/api/worker/fpp_release",
+                json={
+                    "candidate_id": task["candidate_id"],
+                    "claim_id": task.get("fpp_claim_id"),
+                    "tic_id": task.get("tic_id"),
+                    "reason": getattr(error, "skip_reason", None) or "population_invalid",
+                },
+                headers=self._headers(), timeout=10)
+            if getattr(response, "status_code", 200) >= 400:
+                self.logger.warning(
+                    "[FPP] release refused for candidate %s (HTTP %s); "
+                    "server timeout recovery remains available",
+                    task.get("candidate_id"), response.status_code)
+        except Exception as release_error:
+            self.logger.warning(
+                "[FPP] immediate release failed for candidate %s: %s; "
+                "server timeout recovery remains available",
+                task.get("candidate_id"), release_error)
+
     def _fetch_and_load_fpp(self):
         """Reserve the next FPP task at the server and pre-load its light
         curve. Returns a ``prepared`` dict (or ``None`` on no-task / failure).
@@ -3548,8 +4039,32 @@ class ExoNitWorker:
         if not task:
             return None
         tic_id = task["tic_id"]
+        if _fpp_native_enabled:
+            population = task.get("population")
+            crosscheck = task.get("population_crosscheck")
+            reason = None
+            if task.get("population_missing") or not isinstance(population, dict):
+                reason = "population_missing"
+            elif _population_provenance_missing(task):
+                reason = "population_invalid"
+            elif not isinstance(crosscheck, dict) or crosscheck.get("gaia_available") is not True:
+                reason = "population_crosscheck_unverified"
+            elif crosscheck.get("alarm") and population.get("header", {}).get("source") != "gaia":
+                reason = "population_alarm_unresolved"
+            if reason:
+                error = FPPUnavailable(reason)
+                error.skip_reason = reason
+                self._release_fpp_unavailable(task, error)
+                return None
+        # Same gap_fill_detrend_only resolution as process_task (backfill
+        # tasks normally carry no config -> worker config), so backfill FPP
+        # sees the same light curve as in-task FPP for the same flag value.
+        load_kwargs = ({"gap_fill_detrend_only": True}
+                       if self._gap_fill_detrend_only_enabled(task.get("config"))
+                       else {})
         try:
-            time_arr, flux_arr, _raw_flux_arr, n_sectors, _ = self._load_star(tic_id)
+            time_arr, flux_arr, _raw_flux_arr, n_sectors, star_meta = self._load_star(
+                tic_id, **load_kwargs)
         except Exception as e:
             self.logger.warning(f"[FPP-prefetch] _load_star {tic_id} failed: {e}")
             try:
@@ -3570,6 +4085,9 @@ class ExoNitWorker:
             "time_arr": time_arr,
             "flux_arr": flux_arr,
             "n_sectors": n_sectors,
+            # the product the light curve was REALLY stitched from (an FFI fallback is 'unknown'); the server's task
+            # `lc_source` (from metadata.fits_files) is only the fallback when the load did not say
+            "lc_source": (star_meta.get("lc_source") if isinstance(star_meta, dict) else None),
         }
 
     def _process_prepared_fpp(self, prepared):
@@ -3597,12 +4115,15 @@ class ExoNitWorker:
                 sectors_arr, time_arr, flux_arr,
                 workdir=self.fits_cache_dir,
                 server_url=self.server, token=self.token,
-                abort_check=lambda: not self.running)
+                abort_check=lambda: not self.running,
+                **self._fpp_population_kwargs(task),
+                **_fpp_extra_kwargs(prepared.get("lc_source") or task.get("lc_source"), task,
+                                    t0_convention=_stored_t0_convention(task)))
             elapsed = time.time() - t0
             if result:
                 self.logger.info(
                     f"[FPP] TIC {tic_id}: FPP={result['fpp']:.4f} "
-                    f"({result['verdict']}) {elapsed:.1f}s")
+                    f"({result['verdict']}) {elapsed:.1f}s{_fpp_ephem_log(result)}")
                 requests.post(f"{self.server}/api/worker/fpp_result",
                     json={
                         "candidate_id": task["candidate_id"],
@@ -3612,6 +4133,7 @@ class ExoNitWorker:
                         "prob_planet": result.get("prob_planet"),
                         "verdict": result.get("verdict"),
                         "candidate": task,
+                        **_fpp_result_model_fields(result),
                     },
                     headers=self._headers(), timeout=30)
             else:
@@ -3624,11 +4146,19 @@ class ExoNitWorker:
                         "fpp": -1.0,
                         "nfpp": -1.0,
                         "verdict": "failed",
+                        # WHY it failed (e.g. stellar_params_missing) so the server can store/count it
+                        "skip_reason": getattr(calc_fpp, "last_skip_reason", None),
                         "candidate": task,
                     },
                     headers=self._headers(), timeout=30)
         except FPPAborted:
             self.logger.info(f"[FPP] Aborted by user")
+        except FPPUnavailable as e:
+            reason = getattr(e, "skip_reason", None) or "unknown"
+            self.logger.warning(
+                "[FPP] TIC %s unavailable (%s); requesting immediate retry",
+                tic_id, reason)
+            self._release_fpp_unavailable(task, e)
         except Exception as e:
             msg = str(e)
             transient = "No JSON" in msg or "Connection" in msg
@@ -4020,7 +4550,7 @@ if __name__ == "__main__":
         "--server-url",
         help="Override server_url from config.json. The committed default is "
              "http://localhost:8400 (correct for worker-default); remote "
-             "hosts must use the server's network address. Same rationale as "
+             "hosts must use <host>'s network address. Same rationale as "
              "--worker-name: host-specific identity stays out of config.json.",
     )
     args = parser.parse_args()

@@ -1,17 +1,6 @@
 import Foundation
 import SQLite3
 
-public struct OutboxEntry: Equatable, Sendable {
-    public let id: String
-    public let endpoint: String
-    public let workerID: String
-    public let payload: Data
-    public let createdAt: Date
-    public let attempts: Int
-    public let nextAttemptAt: Date
-    public let lastError: String?
-}
-
 public enum OutboxError: Error, CustomStringConvertible, Sendable {
     case sqlite(code: Int32, message: String)
     public var description: String {

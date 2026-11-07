@@ -152,7 +152,7 @@ def register(app, deps: ServerDeps) -> None:
                                    + out["fleet"].get("pending", 0))
         ip = out["server"].get("public_ip")
         if out["server"].get("state") == "running" and ip:
-            # Inject the AWS deployment's token so the operator doesn't type it.
+            # Inject the AWS deployment's token so the owner doesn't type it.
             aws_token = os.environ.get("EXONIT_AWS_WORKER_TOKEN", cfg.worker_token)
             # 8400 = the AWS server's port (fixed in its systemd unit), not
             # necessarily this (home) server's cfg.port.

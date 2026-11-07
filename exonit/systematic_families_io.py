@@ -28,6 +28,7 @@ relative order for a byte-identical veto decision after reload.
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List
 
 import pandas as pd
@@ -35,6 +36,10 @@ import pandas as pd
 # Column order in the persisted Parquet file. ``_order`` is dropped from the
 # reconstructed dicts (it is bookkeeping, not part of the sysp entry shape).
 _COLUMNS = ["_order", "period", "n_stars", "epoch_agnostic", "epoch_phase", "concentration"]
+# Veto-v2 (EXONIT_VETO_V2) families carry extra optional keys; the extra columns are
+# written ONLY when some entry has ``"v2"`` so v1 files stay byte-identical.
+_V2_FLOAT_KEYS = ["sector", "t0_k", "ratio", "p_lo", "p_hi", "t0_mass", "dur_lo", "dur_hi",
+                  "depth_lo", "depth_hi"]
 
 
 def dump_families(sysp: List[Dict[str, Any]], path: str) -> None:
@@ -45,6 +50,7 @@ def dump_families(sysp: List[Dict[str, Any]], path: str) -> None:
     -> NaN in the Parquet column, restored to "key absent" by ``load_families``).
     """
     rows = []
+    is_v2 = any(s.get("v2") for s in sysp)
     for i, s in enumerate(sysp):
         rows.append({
             "_order": i,
@@ -54,7 +60,14 @@ def dump_families(sysp: List[Dict[str, Any]], path: str) -> None:
             "epoch_phase": float(s["epoch_phase"]) if "epoch_phase" in s and s["epoch_phase"] is not None else None,
             "concentration": float(s["concentration"]) if "concentration" in s and s["concentration"] is not None else None,
         })
-    df = pd.DataFrame(rows, columns=_COLUMNS)
+        if is_v2:
+            rows[-1]["v2"] = bool(s.get("v2", False))
+            for k in _V2_FLOAT_KEYS:
+                rows[-1][k] = float(s[k]) if s.get(k) is not None else None
+            rows[-1]["t0_modes"] = json.dumps(s["t0_modes"]) if s.get("t0_modes") else None
+            rows[-1]["kind"] = s.get("kind")
+            rows[-1]["t0_cells"] = json.dumps(s["t0_cells"]) if s.get("t0_cells") else None
+    df = pd.DataFrame(rows, columns=_COLUMNS + (["v2"] + _V2_FLOAT_KEYS + ["t0_modes", "kind", "t0_cells"] if is_v2 else []))
     # Explicit dtypes so an empty *sysp* still produces a schema-stable file
     # (pandas infers "object" for all-NaN/empty columns otherwise, which some
     # Parquet engines round-trip fine but is not worth relying on).
@@ -90,5 +103,20 @@ def load_families(path: str) -> List[Dict[str, Any]]:
         conc = row.get("concentration")
         if conc is not None and pd.notna(conc):
             entry["concentration"] = float(conc)
+        if "v2" in df.columns and bool(row.get("v2")):
+            entry["v2"] = True
+            for k in _V2_FLOAT_KEYS:
+                v = row.get(k)
+                if v is not None and pd.notna(v):
+                    entry[k] = int(v) if k == "sector" else float(v)
+            tm = row.get("t0_modes")
+            if tm is not None and isinstance(tm, str):
+                entry["t0_modes"] = json.loads(tm)
+            kd = row.get("kind")
+            if isinstance(kd, str):
+                entry["kind"] = kd
+            tc = row.get("t0_cells")
+            if isinstance(tc, str):
+                entry["t0_cells"] = json.loads(tc)
         out.append(entry)
     return out

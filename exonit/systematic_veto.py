@@ -129,6 +129,17 @@ docs/superpowers/specs/2026-08-01-postprocess-streaming.md §3.B):
     families harness. Wiring the columnar loader into
     scripts/discovery_postprocess.py is F3, not this change — F2 lands the
     computation with parity tests only, nobody calls it yet.
+
+Changes 2026-10-15 (EXONIT_VETO_V2, exonit/systematic_veto_v2.py):
+  - v1 families (>= 10 TICs in a 2 % bin, period-only match below 2 d) cover 100 %
+    of 0.5-2 d on the campaign population (docs/reviews/2026-10-15-ir-pilot-loss-
+    analysis.md).  v2 families are density excesses with shape/epoch/sector
+    similarity and an SNR soft tag (docs/reviews/2026-10-15-systematic-veto-fix-
+    report.md).  Additive only: ``is_vetoed`` gained optional ``duration`` /
+    ``depth`` / ``snr`` / ``sector`` that are ignored by v1 families (entries
+    without ``"v2": True``), ``ColumnarPopulation`` gained optional ``dur`` /
+    ``depth`` / ``sector`` arrays (empty unless ``from_rows(..., with_shape=True)``).
+    Default OFF (``EXONIT_VETO_V2=1`` enables v2); off = v1 pipeline exactly.
 """
 from __future__ import annotations
 
@@ -387,6 +398,14 @@ class ColumnarPopulation:
     tic: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
     period: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float64))
     t0: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float64))
+    # Veto v2 only (EXONIT_VETO_V2): per-row duration_days / depth_ppm, filled by
+    # ``from_rows(..., with_shape=True)``; EMPTY (zero memory) otherwise, so the
+    # v1 columnar path is unchanged.
+    # (float32 / int16: 10 B/row extra, ~0.6 GB at 60 M rows)
+    dur: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
+    depth: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
+    # sector per row (veto v2 per-sector families); -1 where NULL
+    sector: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int16))
 
     def __len__(self) -> int:
         return len(self.tic)
@@ -396,6 +415,7 @@ class ColumnarPopulation:
         cls,
         rows: Iterable[Dict[str, Any]],
         batch_size: int = 50_000,
+        with_shape: bool = False,
     ) -> "ColumnarPopulation":
         """Build a ColumnarPopulation from a flat iterable of row dicts.
 
@@ -429,6 +449,12 @@ class ColumnarPopulation:
         buf_tic: List[int] = []
         buf_period: List[float] = []
         buf_t0: List[float] = []
+        dur_blocks: List[np.ndarray] = []
+        depth_blocks: List[np.ndarray] = []
+        buf_dur: List[float] = []
+        buf_depth: List[float] = []
+        sector_blocks: List[np.ndarray] = []
+        buf_sector: List[int] = []
 
         def _flush() -> None:
             if not buf_tic:
@@ -439,6 +465,13 @@ class ColumnarPopulation:
             buf_tic.clear()
             buf_period.clear()
             buf_t0.clear()
+            if with_shape:
+                dur_blocks.append(np.array(buf_dur, dtype=np.float32))
+                depth_blocks.append(np.array(buf_depth, dtype=np.float32))
+                sector_blocks.append(np.array(buf_sector, dtype=np.int16))
+                buf_dur.clear()
+                buf_depth.clear()
+                buf_sector.clear()
 
         for i, row in enumerate(rows):
             raw_tic = row["tic_id"]
@@ -456,16 +489,29 @@ class ColumnarPopulation:
             buf_period.append(float(p) if p is not None else math.nan)
             t0 = row.get("t0")
             buf_t0.append(float(t0) if t0 is not None else math.nan)
+            if with_shape:
+                du = row.get("duration_days")
+                de = row.get("depth_ppm")
+                buf_dur.append(float(du) if du is not None else math.nan)
+                buf_depth.append(float(de) if de is not None else math.nan)
+                se = row.get("sector")
+                buf_sector.append(int(se) if se is not None else -1)
             if len(buf_tic) >= batch_size:
                 _flush()
         _flush()
 
         if not tic_blocks:
             return cls()
+        extra = {}
+        if with_shape:
+            extra = dict(dur=np.concatenate(dur_blocks),
+                         depth=np.concatenate(depth_blocks),
+                         sector=np.concatenate(sector_blocks))
         return cls(
             tic=np.concatenate(tic_blocks),
             period=np.concatenate(period_blocks),
             t0=np.concatenate(t0_blocks),
+            **extra,
         )
 
 
@@ -786,8 +832,18 @@ def is_vetoed(
     systematics: List[Dict[str, Any]],
     period_tol: float = 0.3,
     phase_tol_frac: float = 0.1,
+    duration: Optional[float] = None,
+    depth: Optional[float] = None,
+    snr: Optional[float] = None,
+    sector: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """Return the matching systematic if (period, t0) is vetoed, else None.
+
+    ``duration`` / ``depth`` / ``snr`` / ``sector`` are used ONLY by veto-v2 families
+    (entries with ``"v2": True``, exonit/systematic_veto_v2.py): shape
+    similarity and the SNR soft-tag (a soft-tagged match returns None here —
+    see ``systematic_veto_v2.soft_family``).  v1 families ignore them, so v1
+    behaviour is byte-identical.
 
     Matches on period proximity AND epoch proximity (circular). If ``t0`` is None,
     a period match alone vetoes (conservative).
@@ -833,6 +889,11 @@ def is_vetoed(
     """
     eff_period_tol = _effective_period_tol(period, period_tol)
     for s in systematics:
+        if s.get("v2"):
+            from exonit.systematic_veto_v2 import family_decision_v2
+            if family_decision_v2(s, period, t0, duration, depth, snr, sector) == "veto":
+                return s
+            continue
         # epoch_agnostic: use relative 2% tolerance (matches cluster construction);
         # do NOT use _effective_period_tol which can be up to 0.3 d absolute.
         if s.get("epoch_agnostic"):
@@ -999,7 +1060,10 @@ def find_deep_eclipse_hosts(
         # is_vetoed returns the matching systematic dict (truthy) or None (falsy).
         # Conservative with t0=None: period match alone is sufficient for
         # epoch-clustered systematics (is_vetoed handles this internally).
-        if period is not None and is_vetoed(period, t0, systematic_periods):
+        if period is not None and is_vetoed(period, t0, systematic_periods,
+                                            duration=c.get("duration_days"),
+                                            depth=depth, snr=c.get("snr"),
+                                            sector=c.get("sector")):
             eb_hosts.add(tic)
             continue
 

@@ -146,6 +146,16 @@ def _predict_single_v2_1(stage1, stage2, candidate: dict, star_info: dict,
     duration = float(cand.get("duration_days") or 0)
     snr = float(cand.get("snr") or 0)
     snr_log1p = float(np.log1p(snr))
+    # A missing cnn_score (None = CNN not available, e.g. a sparse FFI view,
+    # which cnn_ffi.py returns as None since 2026-10-15) is mapped to 0 here
+    # ON PURPOSE and must stay that way for the deployed v2.1 model: this
+    # inference path has always fed it 0 for a missing score, so the live
+    # verdicts were produced that way. There is no train/serve skew: every
+    # cnn_score split in both deployed stages has missing_type None (training
+    # saw no NaN for this feature; lowest split 0.75), so LightGBM converts a
+    # NaN to 0 at prediction and NaN and 0 take the same branch. A retrain
+    # that includes NULL-cnn rows must decide explicitly how to encode them.
+    # docs/reviews/2026-10-15-cnn-exact-zero-scores.md §7.1.
     cnn = float(cand.get("cnn_score") or 0)
 
     tri = _float_or_sentinel(cand.get("triceratops_fpp"))

@@ -13,7 +13,7 @@ Predicates (§1 of the spec):
     done(t)          — a ``completed`` row exists for *t* in ANY sector.
                         Monotonic: a later failure never un-does it.
     exhausted(t, S)  — the row for (t, S) is ``failed`` with
-                        ``attempts >= MAX_LOTS_PER_SECTOR`` (operator decision,
+                        ``attempts >= MAX_LOTS_PER_SECTOR`` (the owner's decision,
                         §7.1: 2 — one terminal worker-failure, one retry lot,
                         a second terminal failure exhausts the TIC for that
                         sector).
@@ -41,7 +41,7 @@ from __future__ import annotations
 import os
 from typing import Iterable, Optional
 
-# Operator decision, spec §7.1: one retry lot per sector before a TIC is
+# the owner's decision, spec §7.1: one retry lot per sector before a TIC is
 # considered exhausted for that sector (a single terminal worker-failure — 3
 # exhausted worker attempts, see db.MAX_TASK_ATTEMPTS — does NOT exhaust the
 # TIC; a SECOND terminal failure for the same sector does).
@@ -193,8 +193,8 @@ def retryable_failed_ids(backend, sectors: Iterable[int]) -> set:
     *sectors* is normally ``(sector, LEGACY_SECTOR)`` — the requirement (b)
     of the done-state design's own §1 checklist ("a single failure must
     stay selectable") covers both this sector's own failures AND the
-    legacy/backfilled rows written with ``sector=0`` (spec's own note: "the 0
-    covers the legacy/backfill failures").
+    legacy/backfilled rows written with ``sector=0`` (spec's own note: "el 0
+    cobreix els fallats llegat/backfill").
 
     Small result by construction (a lot's worth of failures, not the whole
     table) — a plain ``IN (...)`` + status/attempts filter, no chunking
@@ -285,7 +285,7 @@ _MARK_DONE_COLS = ("tic_id", "sector", "status", "attempts", "last_task_id",
 
 
 def mark_tic_done(backend, tic_id, task_id=None) -> None:
-    """Upsert (tic_id, sector) as ``completed`` (§2.2 hot path).
+    """Upsert (tic_id, sector) as ``completed`` (§2.2 camí calent).
 
     A success always sets status='completed', whatever it was before — this
     is the write side of done(t)'s monotonicity (a later failure elsewhere
@@ -303,7 +303,7 @@ def mark_tic_done(backend, tic_id, task_id=None) -> None:
 
 
 def mark_tic_failed(backend, tic_id, task_id=None, error=None) -> None:
-    """Upsert (tic_id, sector) as a terminal failure (§2.2 hot path).
+    """Upsert (tic_id, sector) as a terminal failure (§2.2 camí calent).
 
     ONLY for a task's terminal failure (``db.requeue_or_fail_task`` returning
     'failed', i.e. worker-attempts exhausted) — an internal requeue

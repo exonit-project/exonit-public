@@ -13,6 +13,9 @@ public struct MultiPlanetOptions: Equatable, Sendable {
     public var harmonicLongPeriodRecovery: Bool = false
     public var harmonicLongPeriodMinimumDays: Double = 10
     public var harmonicLongSNRFactor: Double = 0.5
+    /// Config `harmonic_epoch_class` (default false): epoch-class promotion / demotion veto
+    /// in the harmonic resolver and parity-directed duplicate rule in the protected slots.
+    public var harmonicEpochClass: Bool = false
     public var longPeriodSweep: LongPeriodSweepOptions? = LongPeriodSweepOptions()
 
     public init() {}
@@ -31,9 +34,18 @@ public enum MultiPlanetSearcher {
         stellarRadiusSolar: Double?, stellarMassSolar: Double?,
         source: LightCurveSource, options: MultiPlanetOptions = MultiPlanetOptions(),
         maxConcurrency: Int = ProcessInfo.processInfo.activeProcessorCount,
-        blsBackend: BLSComputeBackend = .cpu
+        blsBackend: BLSComputeBackend = .cpu,
+        detrendFrame: DetrendFrame? = nil
     ) throws -> MultiPlanetSearchResult {
+        // `detrendFrame` (gap_fill_detrend_only, `ProcessedLightCurve.detrendFrame`):
+        // `time`/`rawFlux`/`initialDetrendedFlux` hold real points only (what
+        // every BLS sees); the re-detrends (loop i>=1, long-period sweep) run
+        // on the frame's full real+synthetic series, returned at the real
+        // points -- the same series the first detrend saw (python worker).
         guard time.count == rawFlux.count, time.count == initialDetrendedFlux.count else {
+            throw DetrendError.lengthMismatch
+        }
+        if let detrendFrame, detrendFrame.realIndex.count != time.count {
             throw DetrendError.lengthMismatch
         }
         var candidates: [CandidateResult] = []
@@ -53,9 +65,8 @@ public enum MultiPlanetSearcher {
                 let coverage = Double(mask.lazy.filter { $0 }.count) / Double(mask.count)
                 if coverage <= options.maximumMaskCoverage {
                     do {
-                        var flattened = try BiweightDetrender.flatten(
-                            time: time, flux: rawFlux, transitMask: mask
-                        )
+                        var flattened = try detrendFrame.map { try $0.flatten(transitMask: mask) }
+                            ?? BiweightDetrender.flatten(time: time, flux: rawFlux, transitMask: mask)
                         let good = flattened.indices.filter { flattened[$0].isFinite && !mask[$0] }
                         let fill = good.isEmpty ? 1 : median(good.map { flattened[$0] })
                         for index in flattened.indices where !flattened[index].isFinite || mask[index] {
@@ -83,8 +94,9 @@ public enum MultiPlanetSearcher {
                     source: source,
                     longPeriodRecovery: options.harmonicLongPeriodRecovery,
                     longPeriodMinimumDays: options.harmonicLongPeriodMinimumDays,
-                    longSNRFactor: options.harmonicLongSNRFactor
-                ), search: search
+                    longSNRFactor: options.harmonicLongSNRFactor,
+                    epochClass: options.harmonicEpochClass
+                ), excluded: mask, search: search
             )
             if result.snr < options.minimumSNR { break }
             let transitMask = makeMask(
@@ -116,8 +128,24 @@ public enum MultiPlanetSearcher {
                     periodMinimum: range.lowerBound, periodMaximum: upper,
                     periodCount: options.periodCount
                 ))
-                let duplicate = candidates.contains {
+                var duplicate = candidates.contains {
                     abs(result.period - $0.periodDays) / max($0.periodDays, 1e-9) < 0.02
+                }
+                if !duplicate, result.period > 0, options.harmonicEpochClass {
+                    // Epoch-coincident P/k or k*P of an accepted candidate; parity picks the
+                    // alias. Parity needs the accepted candidates' OWN transits: use the
+                    // pre-loop detrended flux, no exclusion mask (as worker.py does). The
+                    // Swift worker has no duration_refine, so t0 is always the box START.
+                    duplicate = HarmonicEpochClass.slotDuplicate(
+                        time: time, flux: initialDetrendedFlux,
+                        slotPeriod: result.period, slotT0: result.t0,
+                        slotDuration: result.duration,
+                        accepted: candidates.map {
+                            EpochEphemeris(period: $0.periodDays, t0: $0.t0,
+                                           duration: $0.durationDays)
+                        },
+                        excluded: nil, t0IsCentre: false
+                    )
                 }
                 let physical = TransitPhysics.physicalT14Maximum(
                     periodDays: result.period,
@@ -134,9 +162,9 @@ public enum MultiPlanetSearcher {
             }
         }
         if let longOptions = options.longPeriodSweep,
-           let long = try? LongPeriodSweep.search(
+           let long = try? longPeriodSweepStep(
                 time: time, rawFlux: rawFlux, accumulatedMask: mask,
-                options: longOptions, search: search
+                options: longOptions, detrendFrame: detrendFrame, search: search
            ) {
             let physical = TransitPhysics.physicalT14Maximum(
                 periodDays: long.result.period,
@@ -163,6 +191,30 @@ public enum MultiPlanetSearcher {
             candidates: candidates, accumulatedMask: mask,
             rejectedUnphysicalCount: rejected,
             redetrendFailureCount: totalDetrendFailures
+        )
+    }
+
+    /// Long-period sweep step of `search`: with a `gap_fill_detrend_only`
+    /// frame every window re-detrends the frame's full real+synthetic series
+    /// (result taken at the real points), so the sweep BLS (`search`) only
+    /// ever sees `time` = real points; without a frame it is the legacy
+    /// default detrender on `time`/`rawFlux`.
+    public static func longPeriodSweepStep(
+        time: [Double], rawFlux: [Double], accumulatedMask: [Bool],
+        options: LongPeriodSweepOptions, detrendFrame: DetrendFrame?,
+        search: BLSSearchFunction
+    ) throws -> LongPeriodSweepResult? {
+        let longDetrender: LongPeriodDetrender = { sampleTime, sampleFlux, window, longMask in
+            if let detrendFrame {
+                return try detrendFrame.flatten(windowLength: window, transitMask: longMask)
+            }
+            return try BiweightDetrender.flatten(
+                time: sampleTime, flux: sampleFlux, windowLength: window, transitMask: longMask
+            )
+        }
+        return try LongPeriodSweep.search(
+            time: time, rawFlux: rawFlux, accumulatedMask: accumulatedMask,
+            options: options, detrender: longDetrender, search: search
         )
     }
 

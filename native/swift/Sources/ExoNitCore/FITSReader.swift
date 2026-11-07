@@ -422,4 +422,46 @@ public enum FITSReader {
         guard offset + 8 <= data.count else { throw FITSError.truncated("UInt64") }
         return data.withUnsafeBytes { UInt64(bigEndian: $0.loadUnaligned(fromByteOffset: offset, as: UInt64.self)) }
     }
+
+    /// python `fits_cache_helper.MIN_FITS_BYTES`.
+    public static let minimumValidFileBytes = 30_000
+
+    /// Port of python `fits_cache_helper.is_valid_fits`: nil when the file is
+    /// usable, else the reason. Same checks in the same order: exists, not
+    /// empty, >= 30 000 bytes, parsable primary header, a second HDU whose
+    /// header parses and whose data is present and non-empty (and not cut off).
+    public static func invalidReason(at url: URL) -> String? {
+        // python `stat()` follows symlinks: judge a symlinked cache entry by its target
+        let target = url.resolvingSymlinksInPath()
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: target.path),
+              let size = (attributes[.size] as? NSNumber)?.intValue else {
+            return "file does not exist"
+        }
+        if size == 0 { return "empty file" }
+        if size < minimumValidFileBytes {
+            return "size too short (\(size) bytes < \(minimumValidFileBytes))"
+        }
+        do {
+            let data = try Data(contentsOf: target, options: [.mappedIfSafe])
+            let primary = try readHeader(data, offset: 0)
+            let primaryData = try dataByteCount(primary)
+            let extensionOffset = try checkedAdd(
+                primary.byteCount, try padded(primaryData), context: "primary HDU"
+            )
+            guard extensionOffset < data.count else { return "missing data HDU" }
+            let header = try readHeader(data, offset: extensionOffset)
+            let payload = try dataByteCount(header)
+            let isTable = header.string("XTENSION")?.uppercased() == "BINTABLE"
+            if payload == 0 || (isTable && header.integer("NAXIS2") == 0) {
+                return "empty data HDU"
+            }
+            let end = try checkedAdd(extensionOffset, header.byteCount, context: "data HDU")
+            guard try checkedAdd(end, payload, context: "data HDU") <= data.count else {
+                return "truncated data HDU"
+            }
+            return nil
+        } catch {
+            return "\(type(of: error)): \(error)"
+        }
+    }
 }

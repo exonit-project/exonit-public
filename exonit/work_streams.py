@@ -19,6 +19,8 @@ Key layout (all prefixed ws:{name}):
 from __future__ import annotations
 
 import json
+import os
+import secrets
 import threading
 import time
 from dataclasses import dataclass
@@ -37,6 +39,59 @@ class ClaimedItem:
     #: caller must not treat it as an assignment it can drop: releasing it
     #: (release_replica) is what frees the item for the next idle worker.
     speculative: bool = False
+    claim_id: str | None = None
+
+
+_RELEASE_CLAIM_LUA = r"""
+local item = ARGV[2]
+local consumer = ARGV[3]
+local claim_id = ARGV[4]
+
+local replica_raw = redis.call('HGET', KEYS[4], item)
+if replica_raw then
+    local replica = cjson.decode(replica_raw)
+    if replica.consumer == consumer and replica.claim_id == claim_id then
+        redis.call('HDEL', KEYS[4], item)
+        return 2
+    end
+end
+
+if redis.call('HGET', KEYS[5], item) ~= claim_id then return 0 end
+local msg_id = redis.call('HGET', KEYS[2], item)
+if not msg_id then return 0 end
+local pending = redis.call('XPENDING', KEYS[1], ARGV[1], msg_id, msg_id, 1)
+if not pending or #pending == 0 or pending[1][2] ~= consumer then return 0 end
+local rows = redis.call('XRANGE', KEYS[1], msg_id, msg_id)
+if not rows or #rows == 0 then return 0 end
+local fields = rows[1][2]
+local payload = nil
+local previous = 0
+for i = 1, #fields, 2 do
+    if fields[i] == 'p' then payload = fields[i + 1] end
+    if fields[i] == 'a' then previous = tonumber(fields[i + 1]) end
+end
+if not payload then return 0 end
+
+-- Create the replacement before deleting the owned entry. Redis scripts are
+-- atomic with respect to other clients, but a runtime error does not roll back
+-- earlier writes (for example, XADD can fail under maxmemory).
+local attempts = previous + tonumber(pending[1][4])
+local terminal = attempts >= tonumber(ARGV[5])
+if terminal then
+    redis.call('RPUSH', KEYS[6], cjson.encode({k=item, p=payload, msg_id=msg_id,
+        deliveries=attempts, reason=ARGV[6]}))
+    redis.call('SREM', KEYS[3], item)
+else
+    redis.call('XADD', KEYS[1], '*', 'k', item, 'p', payload, 'a', attempts)
+end
+redis.call('XACK', KEYS[1], ARGV[1], msg_id)
+redis.call('XDEL', KEYS[1], msg_id)
+redis.call('HDEL', KEYS[2], item)
+redis.call('HDEL', KEYS[4], item)
+redis.call('HDEL', KEYS[5], item)
+if terminal then return 3 end
+return 1
+"""
 
 
 #: Speculative tail execution (2026-07-14). See RedisWorkStream.claim_speculative.
@@ -64,7 +119,9 @@ class RedisWorkStream:
         self._k_inflight = f"ws:{name}:inflight"
         self._k_dlq = f"ws:{name}:dlq"
         self._k_spec = f"ws:{name}:spec"
+        self._k_claims = f"ws:{name}:claims"
         self._ensure_group()
+        self._release_claim_script = self._c.register_script(_RELEASE_CLAIM_LUA)
 
     def _ensure_group(self):
         try:
@@ -180,7 +237,7 @@ class RedisWorkStream:
             if not claimed:
                 continue
             _mid, fields = claimed[0]
-            if deliveries >= self.max_deliveries:
+            if deliveries + int(fields.get("a", 0)) >= self.max_deliveries:
                 self._to_dlq(msg_id, fields)
                 continue
             return self._admit(consumer, msg_id, fields,
@@ -252,11 +309,12 @@ class RedisWorkStream:
             item_key = fields.get("k")
             if not item_key:
                 continue
-            if not self._take_replica_slot(item_key, consumer, now):
+            claim_id = secrets.token_hex(16)
+            if not self._take_replica_slot(item_key, consumer, now, claim_id):
                 continue                       # someone is already racing it
             return ClaimedItem(item_key, json.loads(fields.get("p", "{}")),
-                               msg_id, int(entry.get("times_delivered", 1)),
-                               speculative=True)
+                               msg_id, int(entry.get("times_delivered", 1)) + int(fields.get("a", 0)),
+                               speculative=True, claim_id=claim_id)
         return None
 
     def release_replica(self, item_key) -> None:
@@ -268,6 +326,23 @@ class RedisWorkStream:
             self._c.hdel(self._k_spec, item_key)
         except Exception:
             pass
+
+    def release_claim(self, item_key, consumer, claim_id, reason="unavailable") -> str:
+        """Immediately requeue one item only when *consumer* owns its claim.
+
+        A speculative copy owns only its replica slot, so refusing that copy
+        releases the slot while leaving the real owner's PEL entry untouched.
+        Release preserves cumulative deliveries across replacement messages.
+        At max_deliveries the item is dead-lettered with its refusal reason.
+        Returns ``released``, ``dead_lettered``, ``replica_released`` or ``not_owner``.
+        """
+        result = self._release_claim_script(
+            keys=[self._k_stream, self._k_inflight, self._k_queued,
+                  self._k_spec, self._k_claims, self._k_dlq],
+            args=[_GROUP, str(item_key), str(consumer), str(claim_id),
+                  self.max_deliveries, str(reason)])
+        return {0: "not_owner", 1: "released", 2: "replica_released", 3: "dead_lettered"}.get(
+            int(result), "error")
 
     def settle(self, item_key) -> str:
         """Adjudicate a result arriving for *item_key*. One of:
@@ -321,7 +396,7 @@ class RedisWorkStream:
     def _k_settled_of(self, item_key):
         return f"ws:{self.name}:settled:{item_key}"
 
-    def _take_replica_slot(self, item_key, consumer, now) -> bool:
+    def _take_replica_slot(self, item_key, consumer, now, claim_id) -> bool:
         """Claim THE one speculative-replica slot for *item_key*. Atomic.
 
         HSETNX is the gate, so two uvicorn processes racing here produce one
@@ -330,7 +405,8 @@ class RedisWorkStream:
         take over the race; the HSETNX retry after that HDEL keeps even THAT
         handover single-winner.
         """
-        mine = json.dumps({"consumer": str(consumer), "ts": now})
+        mine = json.dumps({"consumer": str(consumer), "ts": now,
+                           "claim_id": str(claim_id)})
         if self._c.hsetnx(self._k_spec, item_key, mine):
             return True
         try:
@@ -350,7 +426,10 @@ class RedisWorkStream:
         item_key = fields["k"]
         payload = json.loads(fields.get("p", "{}"))
         self._c.hset(self._k_inflight, item_key, msg_id)
-        return ClaimedItem(item_key, payload, msg_id, deliveries)
+        claim_id = secrets.token_hex(16)
+        self._c.hset(self._k_claims, item_key, claim_id)
+        return ClaimedItem(item_key, payload, msg_id, deliveries + int(fields.get("a", 0)),
+                           claim_id=claim_id)
 
     def _to_dlq(self, msg_id, fields):
         # RPUSH→XACK→XDEL→SREM/HDEL is not atomic: a crash mid-sequence
@@ -364,6 +443,7 @@ class RedisWorkStream:
         if fields.get("k"):
             self._c.srem(self._k_queued, fields["k"])
             self._c.hdel(self._k_inflight, fields["k"])
+            self._c.hdel(self._k_claims, fields["k"])
             self._c.hdel(self._k_spec, fields["k"])
 
     def ack(self, item_key):
@@ -376,6 +456,7 @@ class RedisWorkStream:
         self._c.xack(self._k_stream, _GROUP, msg_id)
         self._c.xdel(self._k_stream, msg_id)
         self._c.hdel(self._k_inflight, item_key)
+        self._c.hdel(self._k_claims, item_key)
         self._c.srem(self._k_queued, item_key)
         return True
 
@@ -391,59 +472,23 @@ class RedisWorkStream:
         return set(self._c.smembers(self._k_queued))
 
     def release_consumer(self, consumer) -> int:
-        """Requeue every PEL entry still owned by *consumer*. Returns the count.
+        """Release restarted-consumer claims through the same bounded CAS.
 
-        Called when a worker PROCESS RESTARTS (routes/workers.py's
-        /api/worker/register — a fresh process by definition holds no work).
-        Without this, a claim made moments before the process died stays
-        pending, unserved, until the visibility timeout: the fleet autoscaler
-        restarts workers at the SCAN->FPP transition, and on 2026-07-14 it
-        killed 7 workers ~40 s AFTER they had claimed FPP items. The new
-        processes re-registered under the SAME worker_id, so to Redis the
-        consumer looked alive while knowing nothing about those items — the
-        run sat idle at FPP_BACKFILL for the whole timeout with an empty queue.
-        The visibility timeout is the backstop; this is the fix.
-
-        Implemented as ack + re-enqueue (Redis has no "un-claim"): the entry
-        leaves the PEL and comes back as a fresh, immediately-deliverable
-        message. Delivery count resets, which is correct — the item was never
-        actually served to anyone.
-
-        TOCTOU: between reading the PEL and acking, another worker could steal
-        the same entry (its idle already exceeded the visibility timeout), and
-        we would then re-enqueue an item that worker is now computing — a
-        duplicate computation, never a lost item or a corrupt write (both
-        backfill result paths are idempotent upserts on the candidate row).
-        The window is milliseconds and the alternative (a Lua CAS on ownership)
-        buys nothing that matters here.
+        A process restart does not erase attempts already spent on this item.
+        The token and PEL-owner checks also prevent releasing a concurrent steal.
         """
         try:
-            pend = self._c.xpending_range(self._k_stream, _GROUP,
-                                          min="-", max="+", count=1000,
-                                          consumername=str(consumer))
+            pending = self._c.xpending_range(
+                self._k_stream, _GROUP, min="-", max="+", count=1000,
+                consumername=str(consumer))
         except Exception:
             return 0
         released = 0
-        for entry in pend:
-            msg_id = entry["message_id"]
-            rng = self._c.xrange(self._k_stream, min=msg_id, max=msg_id)
-            if not rng:
-                # Already gone (acked/xdel'd by a racing path) — nothing to do.
-                self._c.xack(self._k_stream, _GROUP, msg_id)
-                continue
-            fields = rng[0][1]
-            item_key = fields.get("k")
-            # Drop the old message, then re-add the SAME (key, payload) as a
-            # new entry. srem/hdel first so enqueue()'s sadd de-dup gate (an
-            # item already in `queued` is not re-added) cannot swallow it.
-            self._c.xack(self._k_stream, _GROUP, msg_id)
-            self._c.xdel(self._k_stream, msg_id)
-            if item_key:
-                self._c.hdel(self._k_inflight, item_key)
-                self._c.hdel(self._k_spec, item_key)   # back in the queue for
-                                                       # real: no race to run
-                self._c.srem(self._k_queued, item_key)
-                self.enqueue(item_key, json.loads(fields.get("p", "{}")))
+        for entry in pending:
+            key = self._key_of(entry["message_id"])
+            token = self._c.hget(self._k_claims, key) if key else None
+            if token and self.release_claim(key, consumer, token,
+                                            reason="consumer_restarted") in ("released", "dead_lettered"):
                 released += 1
         return released
 
@@ -504,7 +549,8 @@ class RedisWorkStream:
 
     def clear(self):
         self._c.delete(self._k_stream, self._k_queued,
-                       self._k_inflight, self._k_dlq, self._k_spec)
+                       self._k_inflight, self._k_claims, self._k_dlq,
+                       self._k_spec)
         # The settled markers are one key per item (they carry a real Redis TTL,
         # unlike the hashes above), so they need a scan to go with the rest —
         # a rebuild must not leave a stale "this race is already decided" marker
@@ -536,6 +582,7 @@ class MemoryWorkStream:
                                       #   consumer, claimed_at, deliveries)
             self._queued = set()
             self._inflight = {}       # item_key -> msg_id
+            self._claims = {}         # item_key -> exact current claim token
             self._dlq = []
             self._spec = {}           # item_key -> dict(consumer, ts)
             self._settled = {}        # item_key -> ts a speculative race was won
@@ -547,7 +594,7 @@ class MemoryWorkStream:
                 return False
             self._queued.add(item_key)
             self._seq += 1
-            self._queue.append((str(self._seq), item_key, dict(payload)))
+            self._queue.append((str(self._seq), item_key, dict(payload), 0))
             return True
 
     def enqueue_many(self, items):
@@ -566,7 +613,7 @@ class MemoryWorkStream:
                     continue
                 self._queued.add(item_key)
                 self._seq += 1
-                self._queue.append((str(self._seq), item_key, dict(payload)))
+                self._queue.append((str(self._seq), item_key, dict(payload), 0))
                 enqueued += 1
         return enqueued
 
@@ -584,21 +631,29 @@ class MemoryWorkStream:
                     del self._pel[msg_id]
                     self._queued.discard(ent["item_key"])
                     self._inflight.pop(ent["item_key"], None)
+                    self._claims.pop(ent["item_key"], None)
                     self._spec.pop(ent["item_key"], None)
                     continue
+                claim_id = secrets.token_hex(16)
                 ent.update(consumer=consumer, claimed_at=now,
-                           deliveries=ent["deliveries"] + 1)
+                           deliveries=ent["deliveries"] + 1,
+                           claim_id=claim_id)
                 self._inflight[ent["item_key"]] = msg_id
+                self._claims[ent["item_key"]] = claim_id
                 return ClaimedItem(ent["item_key"], dict(ent["payload"]),
-                                   msg_id, ent["deliveries"])
+                                   msg_id, ent["deliveries"],
+                                   claim_id=claim_id)
             if not self._queue:
                 return None
-            msg_id, item_key, payload = self._queue.pop(0)
+            msg_id, item_key, payload, previous = self._queue.pop(0)
+            claim_id = secrets.token_hex(16)
             self._pel[msg_id] = {"item_key": item_key, "payload": payload,
                                  "consumer": consumer, "claimed_at": now,
-                                 "deliveries": 1}
+                                 "deliveries": previous + 1, "claim_id": claim_id}
             self._inflight[item_key] = msg_id
-            return ClaimedItem(item_key, dict(payload), msg_id, 1)
+            self._claims[item_key] = claim_id
+            return ClaimedItem(item_key, dict(payload), msg_id, previous + 1,
+                               claim_id=claim_id)
 
     def claim_speculative(self, consumer, *, tail_max=SPEC_TAIL_MAX,
                           min_idle_s=None):
@@ -620,17 +675,49 @@ class MemoryWorkStream:
                 rep = self._spec.get(ent["item_key"])
                 if rep and now - rep["ts"] < SPEC_REPLICA_TTL_S:
                     continue           # a live replica already races it
+                claim_id = secrets.token_hex(16)
                 self._spec[ent["item_key"]] = {"consumer": str(consumer),
-                                               "ts": now}
+                                               "ts": now,
+                                               "claim_id": claim_id}
                 return ClaimedItem(ent["item_key"], dict(ent["payload"]),
                                    msg_id, ent["deliveries"],
-                                   speculative=True)
+                                   speculative=True, claim_id=claim_id)
             return None
 
     def release_replica(self, item_key) -> None:
         """Same contract as RedisWorkStream.release_replica."""
         with self._lock:
             self._spec.pop(item_key, None)
+
+    def release_claim(self, item_key, consumer, claim_id, reason="unavailable") -> str:
+        """Memory-backend equivalent of RedisWorkStream.release_claim."""
+        key = str(item_key)
+        consumer = str(consumer)
+        with self._lock:
+            rep = self._spec.get(key)
+            if (rep and str(rep.get("consumer", "")) == consumer
+                    and rep.get("claim_id") == str(claim_id)):
+                self._spec.pop(key, None)
+                return "replica_released"
+            if self._claims.get(key) != str(claim_id):
+                return "not_owner"
+            msg_id = self._inflight.get(key)
+            ent = self._pel.get(msg_id) if msg_id is not None else None
+            if ent is None or str(ent.get("consumer", "")) != consumer:
+                return "not_owner"
+            self._pel.pop(msg_id, None)
+            self._inflight.pop(key, None)
+            self._claims.pop(key, None)
+            self._spec.pop(key, None)
+            # Match Redis XADD: a repeatedly unavailable item must not keep
+            # jumping ahead of other ready candidates.
+            if ent["deliveries"] >= self.max_deliveries:
+                self._dlq.append(dict(ent, msg_id=msg_id, ts=time.time(), reason=str(reason)))
+                self._queued.discard(key)
+                return "dead_lettered"
+            self._queue.append((msg_id, key, dict(ent["payload"]), ent["deliveries"]))
+            self._queued.add(key)
+            return "released"
 
     def settle(self, item_key) -> str:
         """Same contract as RedisWorkStream.settle — read it there for WHY a
@@ -644,6 +731,7 @@ class MemoryWorkStream:
                     self._settled[item_key] = now
                 self._spec.pop(item_key, None)
                 self._inflight.pop(item_key, None)
+                self._claims.pop(item_key, None)
                 self._pel.pop(msg_id, None)
                 self._queued.discard(item_key)
                 return "winner"
@@ -659,6 +747,7 @@ class MemoryWorkStream:
             msg_id = self._inflight.pop(item_key, None)
             if msg_id is None:
                 return False
+            self._claims.pop(item_key, None)
             self._pel.pop(msg_id, None)
             self._queued.discard(item_key)
             return True
@@ -684,11 +773,17 @@ class MemoryWorkStream:
                     continue
                 del self._pel[msg_id]
                 self._inflight.pop(ent["item_key"], None)
+                self._claims.pop(ent["item_key"], None)
                 self._spec.pop(ent["item_key"], None)   # back in the queue for
                                                         # real: no race to run
-                self._queue.insert(0, (msg_id, ent["item_key"],
-                                       dict(ent["payload"])))
-                self._queued.add(ent["item_key"])
+                if ent["deliveries"] >= self.max_deliveries:
+                    self._dlq.append(dict(ent, msg_id=msg_id, ts=time.time(),
+                                          reason="consumer_restarted"))
+                    self._queued.discard(ent["item_key"])
+                else:
+                    self._queue.append((msg_id, ent["item_key"],
+                                        dict(ent["payload"]), ent["deliveries"]))
+                    self._queued.add(ent["item_key"])
                 released += 1
             return released
 
@@ -705,7 +800,9 @@ class MemoryWorkStream:
         uniform contract regardless of backend."""
         with self._lock:
             return [{"k": e.get("item_key"), "p": json.dumps(e.get("payload", {})),
-                     "msg_id": e.get("msg_id"), "ts": e.get("ts")}
+                     "msg_id": e.get("msg_id"), "ts": e.get("ts"),
+                     **({"reason": e["reason"], "deliveries": e["deliveries"]}
+                        if "reason" in e else {})}
                     for e in self._dlq]
 
     def remove_dlq(self, msg_id) -> bool:
@@ -744,15 +841,24 @@ _streams_lock = threading.Lock()
 #: exominer stays at 900s: its tail has not been measured, and one change per
 #: iteration.
 #:
-#: primary: 1800s -> 900s (2026-08-07, operator decision). The 1800 guarded against
+#: primary: 1800s -> 900s (2026-08-07, the owner). The 1800 guarded against
 #: stealing from Python workers whose heartbeat stalls under the GIL during
 #: heavy BLS/injection (legit 5-7 min silences). The primary fleet is now
 #: ~96% native (Rust/Swift; heartbeat on its own thread), keep_if still
 #: vetoes any steal while the owner is alive and on the TIC, and 900s keeps
 #: 2x margin over the documented worst legit silence of the remaining
-#: Python scanners (laptop/M1). Worst downside: duplicate compute.
+#: Python scanners (<host>/M1). Worst downside: duplicate compute.
+#: fpp: env overrides (EXONIT_FPP_VISIBILITY_S / EXONIT_FPP_MAX_DELIVERIES) exist so the owner can retune
+#: them for the FPP v3 runtimes (docs/handoff/fpp-v3-deploy-prep.md, item 2) without a code change; the
+#: defaults are the values above.  Read once at import (the stream is a per-process singleton).
+def _int_env(name, default):
+    raw = os.environ.get(name, "").strip()
+    return int(raw) if raw else default
+
+
 STAGE_SETTINGS = {
-    "fpp":      {"visibility_timeout_s": 300, "max_deliveries": 3},
+    "fpp":      {"visibility_timeout_s": _int_env("EXONIT_FPP_VISIBILITY_S", 300),
+                 "max_deliveries": _int_env("EXONIT_FPP_MAX_DELIVERIES", 3)},
     "exominer": {"visibility_timeout_s": 900, "max_deliveries": 3},
     "primary":  {"visibility_timeout_s": 900, "max_deliveries": 3},
 }

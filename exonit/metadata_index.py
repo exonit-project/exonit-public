@@ -20,7 +20,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
-from .config import config as _cfg
 from .metadata_backend import is_pg_url
 
 logger = logging.getLogger(__name__)
@@ -29,7 +28,7 @@ _QLP_RE = re.compile(r"hlsp_qlp_tess_ffi_s(\d{4})-\d{16}_tess")
 _SPOC_RE = re.compile(r"-s(\d{4})-(\d{16})-(\d+)-s_lc\.fits$")
 
 DEFAULT_FFI_CACHE = "data/ffi_cache"
-DEFAULT_SPOC_ROOT = os.path.join(_cfg.nfs_cache_path, "mastDownload", "TESS")
+DEFAULT_SPOC_ROOT = "/data/tess_cache/mastDownload/TESS"
 # Authoritative TGLC index: the `tglc` table inside metadata_cache.db. The
 # legacy standalone file data/discovery/tglc_cache/tglc_index.db was stranded
 # at 4,973 TICs while the indexing scripts (and load_extended_canonical) moved
@@ -163,7 +162,7 @@ def _glob_fallback(tic: str, ffi_cache: str, spoc_root: str):
     the ``spoc_root`` directory scan, only reached when neither the TGLC
     index nor an existing ``metadata`` row has this TIC. Shared by
     ``ensure_metadata`` (via ``ensure_metadata_bulk``) and
-    ``ensure_metadata_bulk``'s own "no row, no tglc" branch.
+    ``ensure_metadata_bulk``'s own "sense fila, sense tglc" branch.
 
     Returns ``(sectors_sorted, exptime, fits_files, fits_rows)``, or ``None``
     if nothing is found in either cache.
@@ -229,9 +228,9 @@ def ensure_metadata(
 
     Delegates to :func:`ensure_metadata_bulk` (``refresh=False``, a single-TIC
     chunk) — docs/superpowers/specs/2026-09-26-metadata-refresh-and-bulk-
-    enqueue-design.md §2.2: "ensure_metadata(tic) is kept ... and now
-    delegates to ensure_metadata_bulk([tic], refresh=False) to guarantee
-    parity by construction". Behaviourally identical to the pre-2026-09-26
+    enqueue-design.md §2.2: "ensure_metadata(tic) es manté ... i passa a
+    delegar a ensure_metadata_bulk([tic], refresh=False) per garantir
+    paritat per construcció". Behaviourally identical to the pre-2026-09-26
     body (same create-from-TGLC / QLP-glob / SPOC-glob precedence, same
     already-indexed short-circuit for an existing row of ANY source) except
     that a freshly-created TGLC row's ``fits_files`` order is now the
@@ -459,11 +458,6 @@ def ensure_metadata_bulk(
     dedup), so callers that care about relative order (none currently do)
     get it for free.
     """
-    if not os.path.isdir(spoc_root):
-        logger.warning(
-            "ensure_metadata_bulk: SPOC root %r is not a directory — the SPOC "
-            "glob fallback finds nothing (set EXONIT_NFS_CACHE to the SPOC "
-            "FITS cache)", spoc_root)
     ids: List[str] = []
     seen = set()
     for t in tic_ids:

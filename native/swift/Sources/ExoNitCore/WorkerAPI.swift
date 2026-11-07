@@ -261,6 +261,10 @@ public struct WorkerAPIClient: @unchecked Sendable {
         try await send(method: "POST", path: "api/worker/fpp_result", body: payload, workerID: workerID)
     }
 
+    public func releaseFPPTask(_ payload: FPPReleaseRequest, workerID: String) async throws -> StatusResponse {
+        try await send(method: "POST", path: "api/worker/fpp_release", body: payload, workerID: workerID)
+    }
+
     public func postExoMinerResult(_ payload: ExoMinerResultRequest, workerID: String) async throws -> StatusResponse {
         try await send(method: "POST", path: "api/worker/exominer_result", body: payload, workerID: workerID)
     }
@@ -275,6 +279,49 @@ public struct WorkerAPIClient: @unchecked Sendable {
         } catch WorkerAPIError.httpStatus(404, _) {
             return nil
         }
+    }
+
+    /// `fetchMetadata` with an explicit timeout (python FFI fallback: 5 s, best effort).
+    public func fetchMetadata(ticID: String, workerID: String?, timeout: TimeInterval) async throws -> StarMetadata {
+        try await perform(request(method: "GET", path: "api/metadata/\(ticID)", workerID: workerID, timeout: timeout))
+    }
+
+    /// python `worker/server_ffi_client.py::fetch_ffi` (the `_try_ffi_fallback` source):
+    /// `GET /api/ffi/{tic}` with `Authorization: Bearer` ONLY (no X-Worker-ID, no
+    /// Content-Type), the given timeout, NO retries; sectors concatenated and
+    /// sorted by time. nil on ANY failure: transport error/timeout, 404 or any
+    /// status != 200, malformed payload, no sectors, time/flux length mismatch.
+    /// JSON null samples read as NaN (numpy `float`).
+    public func fetchFFIForFallback(ticID: String, timeout: TimeInterval) async -> (time: [Double], flux: [Double])? {
+        var req = URLRequest(url: baseURL.appendingPathComponent("api/ffi/\(ticID)"))
+        req.httpMethod = "GET"
+        req.timeoutInterval = timeout
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        guard let (data, response) = try? await performRaw(req) else {
+            FileHandle.standardError.write(Data("ffi fetch failed for tic \(ticID)\n".utf8))
+            return nil
+        }
+        guard response.statusCode == 200 else {
+            if response.statusCode != 404 {
+                FileHandle.standardError.write(Data("ffi fetch HTTP \(response.statusCode) for tic \(ticID)\n".utf8))
+            }
+            return nil
+        }
+        struct Sector: Decodable { let time: [Double?]; let flux: [Double?] }
+        struct Payload: Decodable { let sectors: [Sector] }
+        guard let payload = try? decoder.decode(Payload.self, from: data), !payload.sectors.isEmpty else { return nil }
+        var time: [Double] = [], flux: [Double] = []
+        for sector in payload.sectors {
+            guard sector.time.count == sector.flux.count else { return nil }
+            time += sector.time.map { $0 ?? .nan }
+            flux += sector.flux.map { $0 ?? .nan }
+        }
+        let order = time.indices.sorted { a, b in  // numpy argsort: NaN last, ties by index
+            let (x, y) = (time[a], time[b])
+            if x.isNaN || y.isNaN { return !x.isNaN && y.isNaN }
+            return x != y ? x < y : a < b
+        }
+        return (order.map { time[$0] }, order.map { flux[$0] })
     }
 
     public func fetchNearby(ticID: String) async throws -> NearbyResponse {
@@ -366,10 +413,10 @@ public struct WorkerAPIClient: @unchecked Sendable {
         try await perform(request(method: method, path: path, workerID: workerID))
     }
 
-    private func request(method: String, path: String, workerID: String?) -> URLRequest {
+    private func request(method: String, path: String, workerID: String?, timeout: TimeInterval? = nil) -> URLRequest {
         var request = URLRequest(url: baseURL.appendingPathComponent(path))
         request.httpMethod = method
-        request.timeoutInterval = method == "GET" ? 30 : 10
+        request.timeoutInterval = timeout ?? (method == "GET" ? 30 : 10)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let workerID {

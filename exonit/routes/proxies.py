@@ -21,6 +21,7 @@ from fastapi import Query, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 
 from exonit import server as _server
+from exonit import stellar_params as _stellar_params
 from exonit.server import (
     _PROJECT_ROOT,
     _ProxyNotFound,
@@ -28,7 +29,6 @@ from exonit.server import (
     _json_safe,
     _object_store,
     _proxy_fetch,
-    derive_mass_from_logg_rad,
     logger,
 )
 from exonit.routes.deps import ServerDeps
@@ -161,31 +161,25 @@ def register(app, deps: ServerDeps) -> None:
         # difference for this endpoint's actual data shapes (lists of star
         # dicts, no tuples). Use the shared one.
 
-        def _overlay_berger(star_list):
-            """Override mass/rad/Teff with Berger+2023 values when the TIC is
-            in the catalog. Applied to both cache-hit and MAST-fetched paths
-            so prior cache entries receive homogeneous parameters too.
-            Returns count of stars overlaid."""
-            n = 0
-            for s in star_list:
-                try:
-                    bg = berger.lookup_by_tic(int(s['ID']))
-                except (ValueError, TypeError):
-                    continue
-                if bg is None:
-                    continue
-                s['mass'] = bg['mass']
-                s['rad'] = bg['rad']
-                s['Teff'] = bg['teff']
-                s['stellar_source'] = 'Berger+2023'
-                n += 1
-            return n
-
+        # Cache path and live path run the SAME enrichment
+        # (exonit.stellar_params.enrich_nearby_stars: TIC mass -> mass derived
+        # from logg+radius -> Berger+2023 overlay, with mass_source provenance).
+        # The nearby_stars table has no logg column, so on the cache path only
+        # the target can be derived (logg from the metadata cache); before
+        # 2026-10-23 the cache path skipped the derivation altogether and a
+        # NaN-mass target got no FPP.
         # 1. Try cache
         cached = cache.get_nearby_stars(tic_id)
         if cached:
             stars, gal_b = cached
-            _overlay_berger(stars)
+            entry = cache.get_entry(tic_id)
+            logg_by_id = {str(tic_id): entry.get("logg")} if entry else {}
+            counts = _stellar_params.enrich_nearby_stars(
+                stars, berger, logg_by_id)
+            if counts["derived_logg_radius"]:
+                logger.info("TIC %s: cache path derived mass from logg+rad "
+                            "for %d star(s)", tic_id,
+                            counts["derived_logg_radius"])
             return _json_safe(
                 {"tic_id": tic_id, "stars": stars, "gal_b": gal_b,
                  "source": "cache"})
@@ -213,7 +207,7 @@ def register(app, deps: ServerDeps) -> None:
                 coord, radius=60 * u.arcsec, catalog="TIC")
 
             stars = []
-            n_mass_derived = 0
+            logg_by_id = {}
             for r in nearby:
                 try:
                     s = {
@@ -226,35 +220,28 @@ def register(app, deps: ServerDeps) -> None:
                         'Tmag': float(r['Tmag']) if r['Tmag'] else None,
                         'plx': float(r['plx']) if r['plx'] else None,
                     }
-                    if s['mass'] is None and s['rad'] is not None:
-                        try:
-                            logg = float(r['logg']) if r['logg'] else None
-                        except (ValueError, TypeError):
-                            logg = None
-                        derived = derive_mass_from_logg_rad(logg, s['rad'])
-                        if derived is not None:
-                            s['mass'] = derived
-                            n_mass_derived += 1
+                    try:
+                        logg_by_id[s['ID']] = (
+                            float(r['logg']) if r['logg'] else None)
+                    except (ValueError, TypeError):
+                        pass
                     if s['Tmag'] is not None:
                         stars.append(s)
                 except (ValueError, TypeError):
                     continue
-            n_berger = _overlay_berger(stars)
-            if n_berger:
-                logger.info(
-                    "TIC %s: Berger+2023 applied to %d/%d nearby stars",
-                    tic_id, n_berger, len(stars))
-            if n_mass_derived:
-                logger.info(
-                    "TIC %s: derived mass from logg+rad for %d/%d nearby stars",
-                    tic_id, n_mass_derived, len(stars))
+            # Cache the ORIGINAL TIC values: enrichment (derived / relation / Berger masses) is applied on read
+            # on both paths, so mass_source stays truthful on a later cache hit.
+            raw_stars = [dict(s) for s in stars]
+            counts = _stellar_params.enrich_nearby_stars(
+                stars, berger, logg_by_id)
+            logger.info("TIC %s: nearby mass sources %s", tic_id, counts)
 
             gal_b = float(coord.galactic.b.deg)
 
             # Save to cache
             # Convert None to NaN for cache storage
             stars_for_cache = []
-            for s in stars:
+            for s in raw_stars:
                 sc = dict(s)
                 for k in ('mass', 'rad', 'Teff', 'Tmag', 'plx'):
                     if sc[k] is None:

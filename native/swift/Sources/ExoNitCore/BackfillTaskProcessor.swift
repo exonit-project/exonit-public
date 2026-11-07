@@ -70,7 +70,7 @@ public final class BackfillTaskProcessor: @unchecked Sendable {
 
     public func processFPP(
         _ task: BackfillTask, workerID: String
-    ) async throws -> FPPResultRequest {
+    ) async throws -> FPPTaskOutcome {
         if let nativeFPP { return try await nativeFPP.processFPP(task, workerID: workerID) }
         guard let sidecar, let configuration else {
             throw NativeFPPError.calculationUnavailable(task.ticID)
@@ -81,18 +81,18 @@ public final class BackfillTaskProcessor: @unchecked Sendable {
         let response = try await sidecar.runFPP(
             task: task, time: loaded.processed.time,
             flux: loaded.processed.flatFlux,
-            sectorCount: loaded.processed.sectorCount,
+            sectorCount: loaded.sectorCount,
             workerPythonDirectory: configuration.workerPythonDirectory,
             workDirectory: workDirectory,
             serverURL: serverURL, token: token
         )
-        return FPPResultRequest(
+        return .result(FPPResultRequest(
             candidateID: task.candidateID, ticID: task.ticID,
             fpp: response.fpp ?? -1, nfpp: response.nfpp ?? -1,
             probabilityPlanet: response.probabilityPlanet,
             verdict: response.verdict ?? (response.status == "ok" ? nil : "failed"),
             candidate: candidateObject(task)
-        )
+        ))
     }
 
     public func processExoMiner(

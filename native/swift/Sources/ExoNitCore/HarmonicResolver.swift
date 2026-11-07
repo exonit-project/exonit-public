@@ -12,18 +12,21 @@ public struct HarmonicResolutionOptions: Equatable, Sendable {
     public var longPeriodRecovery: Bool
     public var longPeriodMinimumDays: Double
     public var longSNRFactor: Double
+    /// Config `harmonic_epoch_class` (default false = behaviour bit-identical to before).
+    public var epochClass: Bool
 
     public init(
         minimumSNR: Double = 5, depthRatioLower: Double = 0.5,
         depthRatioUpper: Double = 2, source: LightCurveSource = .spoc,
         longPeriodRecovery: Bool = false, longPeriodMinimumDays: Double = 10,
-        longSNRFactor: Double = 0.5
+        longSNRFactor: Double = 0.5, epochClass: Bool = false
     ) {
         self.minimumSNR = minimumSNR; self.depthRatioLower = depthRatioLower
         self.depthRatioUpper = depthRatioUpper; self.source = source
         self.longPeriodRecovery = longPeriodRecovery
         self.longPeriodMinimumDays = longPeriodMinimumDays
         self.longSNRFactor = longSNRFactor
+        self.epochClass = epochClass
     }
 }
 
@@ -36,14 +39,25 @@ public enum HarmonicResolver {
         let period: Double
         let snrFactor: Double
         let transitGuard: Bool
+        /// k of a `/k` demotion probe (0 for every other probe).
+        var demotionDivisor: Int = 0
     }
 
     public static func resolve(
         time: [Double], flux: [Double], seed: BLSResult,
         periodMinimum: Double, periodMaximum: Double,
         options: HarmonicResolutionOptions = HarmonicResolutionOptions(),
+        excluded: [Bool]? = nil,
         search: BLSSearchFunction
     ) -> BLSResult {
+        if options.epochClass {
+            // Parity evidence is final: a promotion is returned as-is, NO amplitude probes
+            // from the promoted seed (its re-fit SNR is a narrow-window SDE).
+            if let promoted = HarmonicEpochClass.promote(
+                time: time, flux: flux, result: seed, periodMax: periodMaximum,
+                minimumSNR: options.minimumSNR, excluded: excluded, search: search
+            ) { return promoted }
+        }
         var probes: [Probe] = []
         if options.source == .ffi {
             for multiplier in [2.0, 3.0, 4.0, 5.0] {
@@ -74,7 +88,8 @@ public enum HarmonicResolver {
             let period = seed.period / divisor
             if period >= periodMinimum {
                 probes.append(Probe(
-                    period: period, snrFactor: demotionFactor, transitGuard: false
+                    period: period, snrFactor: demotionFactor, transitGuard: false,
+                    demotionDivisor: Int(divisor)
                 ))
             }
         }
@@ -107,6 +122,13 @@ public enum HarmonicResolver {
             }
             if probe.transitGuard, span > 0, candidate.period > 0,
                span / candidate.period < 2 { continue }
+            // Demotion veto (epoch-class only), mode "vh": every class must carry on short
+            // baselines, only the one-class-carries pattern vetoes on long ones.
+            if options.epochClass, probe.demotionDivisor > 0,
+               !HarmonicEpochClass.demotionSupported(
+                   time: time, flux: flux, sub: candidate, k: probe.demotionDivisor,
+                   excluded: excluded
+               ) { continue }
             return candidate
         }
         return seed

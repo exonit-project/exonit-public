@@ -555,3 +555,48 @@ mod tests {
         assert!(matches!(result, Err(FitsError::Truncated(_))));
     }
 }
+
+/// python `fits_cache_helper.MIN_FITS_BYTES`.
+pub const MIN_VALID_FILE_BYTES: u64 = 30_000;
+
+/// Port of python `fits_cache_helper.is_valid_fits` (and Swift
+/// `FITSReader.invalidReason`): `None` when the file is usable, else the
+/// reason. Same checks in the same order: exists, not empty, >= 30 000 bytes,
+/// parsable primary header, a second HDU whose header parses and whose data
+/// is present and non-empty (and not cut off).
+pub fn invalid_reason(path: &Path) -> Option<String> {
+    let size = match std::fs::metadata(path) {
+        Ok(m) => m.len(),
+        Err(_) => return Some("file does not exist".to_string()),
+    };
+    if size == 0 {
+        return Some("empty file".to_string());
+    }
+    if size < MIN_VALID_FILE_BYTES {
+        return Some(format!("size too short ({size} bytes < {MIN_VALID_FILE_BYTES})"));
+    }
+    let check = || -> Result<Option<String>, FitsError> {
+        let data = std::fs::read(path).map_err(|_| FitsError::Truncated("file".into()))?;
+        let primary = read_header(&data, 0)?;
+        let primary_data = data_byte_count(&primary)?;
+        let extension_offset = checked_add(primary.byte_count, padded(primary_data)?, "primary HDU")?;
+        if extension_offset as usize >= data.len() {
+            return Ok(Some("missing data HDU".to_string()));
+        }
+        let header = read_header(&data, extension_offset)?;
+        let payload = data_byte_count(&header)?;
+        let is_table = header.string("XTENSION").map(|s| s.to_uppercase()).as_deref() == Some("BINTABLE");
+        if payload == 0 || (is_table && header.integer("NAXIS2", 0) == 0) {
+            return Ok(Some("empty data HDU".to_string()));
+        }
+        let end = checked_add(extension_offset, header.byte_count, "data HDU")?;
+        if checked_add(end, payload, "data HDU")? as usize > data.len() {
+            return Ok(Some("truncated data HDU".to_string()));
+        }
+        Ok(None)
+    };
+    match check() {
+        Ok(reason) => reason,
+        Err(error) => Some(format!("FitsError: {error}")),
+    }
+}

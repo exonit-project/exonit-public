@@ -21,7 +21,7 @@ Usage
   # Migrate everything (fresh start; TRUNCATEs each PG table first):
   python3 scripts/migration/migrate_metadata_to_pg.py \\
       --sqlite data/metadata_cache.db \\
-      --pg-dsn postgresql://exonit@localhost:5432/exonit_meta
+      --pg-dsn postgresql://exonit@<postgres-host>:5432/exonit_meta
 
   # Migrate one table only:
   python3 scripts/migration/migrate_metadata_to_pg.py --table fits_paths ...

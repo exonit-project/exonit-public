@@ -1,4 +1,4 @@
-"""Shared feature builder for verdict v3_tfopwg (Phase 3, block 2, Phase A).
+"""Shared feature builder for verdict v3_tfopwg (Fase 3, bloc 2, Fase A).
 
 Single source of truth for the v3_tfopwg feature vector, used by BOTH the
 training side (``scripts/build_verdict_v3_tfopwg_dataset.py``,
@@ -11,7 +11,7 @@ Per spec (``docs/superpowers/specs/2026-09-19-verdict-v3-tfopwg-design.md``
 already-deployed v2/v2.1/v2.2 preprocessing pipeline
 (``exonit.verdict_classifier_v2_2.preprocess_v2_2``, which itself chains
 ``preprocess_v2`` → ``preprocess_v2_1`` → ``preprocess_v2_2``) and simply
-selects + reorders the Phase-A subset of columns it produces. The 14 base
+selects + reorders the Fase-A subset of columns it produces. The 14 base
 numeric/derived features (v2 lineage) + NFPP (v2.1) + ``depth_x_rprs``
 (v2.2) are all already columns of ``preprocess_v2_2``'s output — nothing
 needs to be recomputed by hand here.
@@ -20,7 +20,7 @@ Explicitly EXCLUDED vs. what v2.2 computes (spec §4 "Fora"):
   - sector one-hot columns (``sec_*``)           -> memorisation risk at n=870
   - ``exominer_score`` / ``exominer_tce_period_log`` (SPOC)  -> dead in FFI
   - ``triceratops_prob_planet``                  -> redundant w/ FPP, not in
-    the spec's named Phase-A list
+    the spec's named Fase-A list
   - ``ffi_valid``                                -> not in the spec's named
     list either (the raw ``exominer_ffi_score`` sentinel is still cleaned to
     NaN by ``preprocess_v2_2``, just without a companion validity flag)
@@ -51,7 +51,7 @@ disposition-correlated missingness). The feature LIST is now a function of
 an explicit ``fpp_policy`` (see :func:`feature_names_for_policy`) so the
 three candidate fixes can be trained and compared side by side:
 
-  - ``"all"``: the original Phase-A convention (FPP/NFPP values + validity
+  - ``"all"``: the original Fase-A convention (FPP/NFPP values + validity
     flags). Kept only for the REJECTED baseline model
     (``models/verdict_classifier_v3_tfopwg_2026-09-19.pkl``) — do not use
     for new training.
@@ -72,7 +72,7 @@ import pandas as pd
 
 from exonit.verdict_classifier_v2_2 import preprocess_v2_2
 
-# Phase A base feature list (spec §4, minus Berger — see module docstring
+# Fase A base feature list (spec §4, minus Berger — see module docstring
 # "REMOVED 2026-09-19" note), in a fixed, documented order:
 #   14 base numeric/derived (v2 lineage)
 # + depth_x_rprs interaction (v2.2)
@@ -158,7 +158,7 @@ def build_v3_tfopwg_features(df: pd.DataFrame,
     simply not selected), then reindexes to
     ``feature_names_for_policy(fpp_policy)``.
 
-    ``fpp_force_nan``: ablation switch (spec §4 "ablation: FPP forced to NaN")
+    ``fpp_force_nan``: ablation switch (spec §4 "ablació FPP forçat a NaN")
     — when True, ``triceratops_fpp``/``triceratops_nfpp`` are blanked
     *before* preprocessing, so the model sees them exactly as it would a
     genuinely-missing reading (value NaN, validity flag 0). Used only to

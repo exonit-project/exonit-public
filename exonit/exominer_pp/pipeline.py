@@ -49,13 +49,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from exonit.config import config as _config
-
-_PROJECT_ROOT = _config.project_root
-
 DEFAULT_IMAGE = "ghcr.io/nasa/exominer:latest"
-DEFAULT_REPO = os.environ.get(
-    "EXONIT_EXOMINER_REPO", os.path.join(_PROJECT_ROOT, "extern", "ExoMiner"))
+DEFAULT_REPO = os.environ.get("EXONIT_EXOMINER_REPO", os.path.expanduser("~/exonit-extern/ExoMiner"))
 
 
 @dataclass

@@ -1,14 +1,14 @@
 """Deterministic error classifier (phase 1 — v1 rules).
 
-Evaluates an `ErrorContext` against an ordered list of rules (`RULES`);
-the first one that matches determines the returned `PlaybookChoice`, always
-with `source="rules"` and `confidence=1.0`. If no rule matches, returns
-`None` and the supervisor will pass the context to the local AI (out of scope
-for this task).
+Evaluates an `ErrorContext` against an ordered list of rules (`RULES`); the
+first one that matches determines the returned `PlaybookChoice`, always with
+`source="rules"` and `confidence=1.0`. If no rule matches, it returns `None`
+and the supervisor hands the context to the local AI (out of scope for this
+task).
 
 The playbooks referenced here are those of the closed CATALOG in
-`autonomy/playbooks.py`; the `PlaybookChoice`s returned must
-pass `playbooks.validate()`.
+`autonomy/playbooks.py`; the returned `PlaybookChoice` objects must pass
+`playbooks.validate()`.
 """
 
 from __future__ import annotations
@@ -25,15 +25,15 @@ _TRANSIENT_NETWORK_TRIGGERS = (
     "temporarily unavailable",
 )
 
-# Negation guard for rule 3: removes the WHOLE sentence (up to the
-# nearest delimiter, in both directions) that contains "no orphan(s)" or
+# Negation guard for rule 3: removes the entire SENTENCE (up to the nearest
+# delimiter, in both directions) that contains "no orphan(s)" or
 # "0 orphan(s)" before checking whether a positive mention remains.
-# Scoped to the sentence (not global to the whole text) so that a negation
-# in one sentence does not hide a real positive mention in another. The
-# sentence delimiters include ".", ";" and "\n" — the latter is
-# essential because `_text()` joins `detail` and `log_tail` with "\n": without
-# excluding it, a negation in `detail` would also "eat" a positive mention
-# in `log_tail` (or vice versa) across the line break.
+# Scoped to the sentence (not global to the whole text) so that a negation in
+# one sentence does not hide a real positive mention in another. The sentence
+# delimiters include ".", ";" and "\n" — the latter is essential because
+# `_text()` joins `detail` and `log_tail` with "\n": without excluding it, a
+# negation in `detail` would also "eat" a positive mention in `log_tail` (or
+# vice versa) by crossing the line break.
 _ORPHAN_NEGATION_RE = re.compile(r"[^.\n;]*\b(no|0)\s+orphans?\b[^.\n;]*[.\n;]?")
 
 
@@ -46,12 +46,11 @@ def _choice(playbook: str, params: dict, reasoning: str) -> PlaybookChoice:
 
 
 def _is_mac_host(name: str) -> bool:
-    from autonomy.playbooks import is_mac_host
-    return is_mac_host(name)
+    return name.startswith("worker-<host>") or name == "worker-<host>"
 
 
 def _rule_disk_full_mac(ctx: ErrorContext) -> Optional[PlaybookChoice]:
-    """Rule 1: disk full on a Mac (Errno 28 / no space left on device)."""
+    """Rule 1: full disk on a Mac (Errno 28 / no space left on device)."""
     text = _text(ctx)
     if "errno 28" not in text and "no space left on device" not in text:
         return None
@@ -70,7 +69,7 @@ def _rule_disk_full_mac(ctx: ErrorContext) -> Optional[PlaybookChoice]:
     return _choice(
         "pause_and_alert",
         {"reason": "disk full but host undetermined"},
-        "Errno 28 / no space left detected but no identifiable mac host with critical disk",
+        "Errno 28 / no space left detected but no mac host identifiable with critical disk",
     )
 
 
@@ -99,12 +98,13 @@ def _rule_stream_drift(ctx: ErrorContext) -> Optional[PlaybookChoice]:
 def _rule_orphans(ctx: ErrorContext) -> Optional[PlaybookChoice]:
     """Rule 3: orphaned tasks (assigned without heartbeat).
 
-    The "orphan" term is negation-aware and localized: first the sentences
-    containing "no orphan(s)" or "0 orphan(s)" are removed from the text (e.g.
-    a check log reporting there are none); only then is it
+    The term "orphan" is negation-aware and localized: first the sentences
+    containing "no orphan(s)" or "0 orphan(s)" are removed from the text
+    (e.g. a check log reporting that there are none); only afterwards is it
     checked whether a real positive mention remains. A negation in one
-    sentence does not suppress a positive mention in another sentence of the same
-    text. The independent "assigned"+"heartbeat" pattern is evaluated separately.
+    sentence does not suppress a positive mention in another sentence of the
+    same text. The independent "assigned"+"heartbeat" pattern is evaluated
+    separately.
     """
     text = _text(ctx)
     cleaned = _ORPHAN_NEGATION_RE.sub("", text)
@@ -135,7 +135,7 @@ def _rule_transient_network(ctx: ErrorContext) -> Optional[PlaybookChoice]:
     return _choice(
         "resume_run",
         {"run_id": ctx.run_id},
-        "transient network/API error detected, resume_run not yet attempted",
+        "transient network/API error detected, resume_run not attempted yet",
     )
 
 

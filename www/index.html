@@ -51,7 +51,7 @@
   .hero-detail { padding: var(--sp-4) var(--sp-6) var(--sp-6); display: flex; flex-direction: column; gap: var(--sp-2); }
 
   /* Pipeline stages: a hairline rail behind the row connects the .step
-     chips (spec: "row of stage chips connected by a hairline line"). */
+     chips (spec: "fila d'etapes connectades per línia hairline"). */
   .steps { position: relative; }
   .steps::before { content: ""; position: absolute; left: var(--sp-2); right: var(--sp-2); top: 15px; height: 1px; background: var(--line); z-index: 0; }
   .steps .step { position: relative; z-index: 1; }
@@ -100,7 +100,7 @@
              #bgScene rule is fixed/fullscreen/z-index:-1 for the ambient
              pages, which this task cannot edit — so the hero canvas uses
              its own id and is sized/positioned by the .hero-scene rules
-             above instead (in-flow, ~380px, spec §3 "inside the hero block"). -->
+             above instead (in-flow, ~380px, spec §3 "dins del bloc hero"). -->
         <canvas id="heroCanvas" aria-hidden="true"></canvas>
         <div class="hero-overlay" id="heroOverlay">
           <div class="kicker">Pipeline status</div>
@@ -456,8 +456,8 @@ function humanizeAlert(a) {
 }
 
 // Split in two: heroOverlayEl carries only the answer-first sentence plus
-// ONE big number (spec "on top... the existing headline (status sentence +
-// big number)"), painted over the live scene; heroDetailEl carries the
+// ONE big number (spec "a sobre... el headline existent (frase d'estat +
+// número gran)"), painted over the live scene; heroDetailEl carries the
 // supporting numbers/status/alerts that used to share the same card as one
 // big grid. "Time remaining" moved into the hero figure and is no longer
 // repeated as its own stat-block below (www/CLAUDE.md: "don't repeat the
@@ -606,8 +606,8 @@ function renderHeadline() {
 }
 
 // ── Pipeline stages block ─────────────────────────────────────────────────
-// One horizontal row of phase chips (owner request: "a single row with one
-// button per phase and the current phase lit up"), connected by the
+// One horizontal row of phase chips (owner request: "a single row with a
+// button for each phase and the current phase lit"), connected by the
 // hairline rail (.steps::before, above) and lit per spec §7: current phase
 // gets the --accent-dim wash + pulsing dot (.step-current, exonit.css);
 // completed phases get a --ok check mark; pending phases stay --ink-mute.
@@ -934,7 +934,7 @@ const lightcurvePathEl = document.getElementById('lightcurvePath');
 const lightcurvePointEl = document.getElementById('lightcurvePoint');
 
 // Synthetic flux-vs-phase curve for the SVG (decorative-narrative, not real
-// data — spec §6.1: "NO tooltip; it is aria-hidden"). A raised-cosine
+// data — spec §6.1: "carries NO tooltip; it is aria-hidden"). A raised-cosine
 // dip, symmetric around the transit. viewBox is 800×100 user units.
 const LC_W = 800, LC_BASE_Y = 22, LC_DEPTH = 46, LC_HALF_WIDTH = 0.09;
 

@@ -1,6 +1,6 @@
 """Shared-queue work pool for distributing LoRA explanation calls across
-several explainer endpoints (design: docs/superpowers/plans — "fase LoRA
-als 5 Mac mini M4", part 1 "Work distribution").
+several explainer endpoints (design: docs/superpowers/plans — "LoRA phase
+on the 5 Mac mini M4", part 1 "Work distribution").
 
 Why a shared queue and not a partition by ``id % N`` (the <host> precedent,
 memory ``reference_lora_turbo_distributed_pcmarc``): a static partition

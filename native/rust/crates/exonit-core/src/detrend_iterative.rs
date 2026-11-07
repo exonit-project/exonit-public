@@ -80,15 +80,36 @@ pub fn flatten_with_backend(
     snr_threshold: f64,
     backend: &detrend::DetrendBackend,
 ) -> Result<IterativeDetrendResult, DetrendError> {
+    flatten_with_backend_excluding(time, flux, quick_search, snr_threshold, backend, None)
+}
+
+/// [`flatten_with_backend`] for `gap_fill_detrend_only` (worker.py
+/// `_load_star`): both wotan passes still see every point, but points flagged
+/// in `excluded` (gap-fill synthetic points) are kept out of the quick BLS
+/// input and are never transit-masked. `None` == [`flatten_with_backend`].
+pub fn flatten_with_backend_excluding(
+    time: &[f64],
+    flux: &[f64],
+    quick_search: &dyn QuickBlsSearch,
+    snr_threshold: f64,
+    backend: &detrend::DetrendBackend,
+    excluded: Option<&[bool]>,
+) -> Result<IterativeDetrendResult, DetrendError> {
     if time.len() != flux.len() {
         return Err(DetrendError::LengthMismatch);
     }
+    if let Some(ex) = excluded {
+        if ex.len() != time.len() {
+            return Err(DetrendError::MaskLengthMismatch);
+        }
+    }
+    let is_excluded = |index: usize| excluded.map_or(false, |ex| ex[index]);
     let first = detrend::flatten_with_backend(time, flux, None, backend)?;
 
     let mut finite_time: Vec<f64> = Vec::new();
     let mut finite_flux: Vec<f64> = Vec::new();
     for index in 0..time.len() {
-        if time[index].is_finite() && first[index].is_finite() {
+        if time[index].is_finite() && first[index].is_finite() && !is_excluded(index) {
             finite_time.push(time[index]);
             finite_flux.push(first[index]);
         }
@@ -107,7 +128,8 @@ pub fn flatten_with_backend(
     let duration_fraction = quick.duration / quick.period;
     let mask: Vec<bool> = time
         .iter()
-        .map(|&value| {
+        .enumerate()
+        .map(|(index, &value)| {
             // Swift: `(value - t0).truncatingRemainder(dividingBy: period) / period`,
             // then `if phase < 0 { phase += 1 }`. Rust's `%` on f64 is
             // fmod-equivalent (same sign as the dividend), matching
@@ -117,7 +139,7 @@ pub fn flatten_with_backend(
             if phase < 0.0 {
                 phase += 1.0;
             }
-            phase < duration_fraction || phase > 1.0 - duration_fraction
+            (phase < duration_fraction || phase > 1.0 - duration_fraction) && !is_excluded(index)
         })
         .collect();
 

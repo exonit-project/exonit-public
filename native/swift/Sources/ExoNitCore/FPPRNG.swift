@@ -8,6 +8,11 @@ public struct FPPRNG: Sendable {
 
     public init(seed: UInt32) { mt = NumPyMT19937(seed: seed) }
     public mutating func rand() -> Double { mt.uniform01() }
+    /// NumPy `RandomState.randint(low, high)`, with an exclusive high bound.
+    public mutating func randint(low: Int, high: Int) -> Int {
+        precondition(high > low && high - low <= Int(UInt32.max))
+        return low + Int(mt.interval(maxInclusive: UInt32(high - low - 1)))
+    }
     public mutating func gauss() -> Double {
         if hasGauss { hasGauss = false; defer { cachedGauss = 0 }; return cachedGauss }
         while true {

@@ -12,6 +12,8 @@ use super::npsum::{libm_pow, nan_to_num, np_mean, np_median, pairwise_sum};
 use super::priors::{sample_ecc, sample_inc, sample_q, sample_q_companion, sample_rp, sample_w};
 use super::rng::FppRng;
 use super::stellar::{flux_relation, get_ldc, stellar_relations};
+use super::v2::math::sin;
+use super::v2::s_family::{batch_eb_transit_lnl_prod, batch_transit_lnl_prod, ProdFold};
 
 pub const MSUN: f64 = 1.989e33;
 pub const RSUN: f64 = 6.957e10;
@@ -26,6 +28,9 @@ pub struct Probes {
     pub samplers: Vec<(String, usize, Vec<f64>)>,
     pub dispatch: Vec<(String, usize, Vec<f64>, f64, usize)>,
     pub lnz: Vec<(String, Vec<f64>)>,
+    /// NaN likelihood draws observed before log-weight reduction. The Python
+    /// dispatcher counts these as unconverged Kepler roots.
+    pub kepler_unconverged_draws: u64,
 }
 
 impl Probes {
@@ -41,6 +46,9 @@ impl Probes {
         let mut sum = 0.0;
         let mut n_finite = 0usize;
         for &v in lnl {
+            if v.is_nan() {
+                self.kepler_unconverged_draws += 1;
+            }
             if v.is_finite() {
                 sum += v;
                 n_finite += 1;
@@ -102,6 +110,76 @@ pub fn lnz_ttp(
     companion_is_host: bool,
     lnz_label: Option<&str>,
 ) -> f64 {
+    lnz_ttp_impl(
+        rng,
+        probes,
+        time,
+        flux,
+        sigma,
+        p_orb,
+        star,
+        n,
+        u1,
+        u2,
+        companion_fr,
+        companion_is_host,
+        lnz_label,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn lnz_ttp_with_fold(
+    rng: &mut FppRng,
+    probes: &mut Probes,
+    time: &[f64],
+    flux: &[f64],
+    sigma: f64,
+    p_orb: f64,
+    star: &StarParams,
+    n: usize,
+    u1: f64,
+    u2: f64,
+    companion_fr: f64,
+    companion_is_host: bool,
+    lnz_label: Option<&str>,
+    fold: &ProdFold<'_>,
+) -> f64 {
+    lnz_ttp_impl(
+        rng,
+        probes,
+        time,
+        flux,
+        sigma,
+        p_orb,
+        star,
+        n,
+        u1,
+        u2,
+        companion_fr,
+        companion_is_host,
+        lnz_label,
+        Some(fold),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lnz_ttp_impl(
+    rng: &mut FppRng,
+    probes: &mut Probes,
+    time: &[f64],
+    flux: &[f64],
+    sigma: f64,
+    p_orb: f64,
+    star: &StarParams,
+    n: usize,
+    u1: f64,
+    u2: f64,
+    companion_fr: f64,
+    companion_is_host: bool,
+    lnz_label: Option<&str>,
+    fold: Option<&ProdFold<'_>>,
+) -> f64 {
     let (m_s, r_s) = (star.m_s, star.r_s);
     // numpy: scalar prefactor uses Python `pi**2` (libm pow); the array
     // `(P*86400)**2` takes npy_pow's x*x fast path; `**(1/3)` is libm pow.
@@ -127,7 +205,7 @@ pub fn lnz_ttp(
 
     let mut mask = vec![false; n];
     for j in 0..n {
-        let e_corr = (1.0 + eccs[j] * (argps[j] * PI / 180.0).sin()) / (1.0 - eccs[j] * eccs[j]);
+        let e_corr = (1.0 + eccs[j] * sin(argps[j] * PI / 180.0)) / (1.0 - eccs[j] * eccs[j]);
         let ptra = (rps[j] * REARTH + r_s * RSUN) / a_cm_scalar * e_corr;
         let inc_min = if ptra <= 1.0 { ptra.acos() } else { PI / 2.0 };
         let coll = (rps[j] * REARTH + r_s * RSUN) > a_cm_scalar * (1.0 - eccs[j]);
@@ -154,7 +232,24 @@ pub fn lnz_ttp(
         companion_fluxratio: &comp_fr_arr,
         companion_is_host,
     };
-    let lnl_masked = batch_transit_lnl(time, flux, sigma, u1, u2, &params);
+    let lnl_masked = if let Some(pf) = fold {
+        batch_transit_lnl_prod(
+            pf,
+            params.ks,
+            params.p_orbs,
+            params.incs_rad,
+            params.a_rs,
+            params.eccs,
+            params.ws_rad,
+            &vec![u1; n_mask],
+            &vec![u2; n_mask],
+            params.companion_fluxratio,
+            companion_is_host,
+        )
+        .0
+    } else {
+        batch_transit_lnl(time, flux, sigma, u1, u2, &params)
+    };
     probes.dispatched("transit", &lnl_masked);
 
     let mut lnl = vec![f64::NEG_INFINITY; n];
@@ -189,6 +284,76 @@ pub fn lnz_teb(
     _companion_fr: f64,
     companion_is_host: bool,
     lnz_label: Option<&str>,
+) -> (f64, f64) {
+    lnz_teb_impl(
+        rng,
+        probes,
+        time,
+        flux,
+        sigma,
+        p_orb,
+        star,
+        n,
+        u1,
+        u2,
+        _companion_fr,
+        companion_is_host,
+        lnz_label,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn lnz_teb_with_fold(
+    rng: &mut FppRng,
+    probes: &mut Probes,
+    time: &[f64],
+    flux: &[f64],
+    sigma: f64,
+    p_orb: f64,
+    star: &StarParams,
+    n: usize,
+    u1: f64,
+    u2: f64,
+    companion_fr: f64,
+    companion_is_host: bool,
+    lnz_label: Option<&str>,
+    fold: &ProdFold<'_>,
+) -> (f64, f64) {
+    lnz_teb_impl(
+        rng,
+        probes,
+        time,
+        flux,
+        sigma,
+        p_orb,
+        star,
+        n,
+        u1,
+        u2,
+        companion_fr,
+        companion_is_host,
+        lnz_label,
+        Some(fold),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lnz_teb_impl(
+    rng: &mut FppRng,
+    probes: &mut Probes,
+    time: &[f64],
+    flux: &[f64],
+    sigma: f64,
+    p_orb: f64,
+    star: &StarParams,
+    n: usize,
+    u1: f64,
+    u2: f64,
+    _companion_fr: f64,
+    companion_is_host: bool,
+    lnz_label: Option<&str>,
+    fold: Option<&ProdFold<'_>>,
 ) -> (f64, f64) {
     let (m_s, r_s) = (star.m_s, star.r_s);
 
@@ -234,7 +399,7 @@ pub fn lnz_teb(
     let mut mask_eb = vec![false; n];
     let mut mask_twin = vec![false; n];
     for j in 0..n {
-        let e_corr = (1.0 + eccs[j] * (argps[j] * PI / 180.0).sin()) / (1.0 - eccs[j] * eccs[j]);
+        let e_corr = (1.0 + eccs[j] * sin(argps[j] * PI / 180.0)) / (1.0 - eccs[j] * eccs[j]);
         let ptra = (radii_eb[j] * RSUN + r_s * RSUN) / a_cm[j] * e_corr;
         let ptra_twin = (radii_eb[j] * RSUN + r_s * RSUN) / a_twin_cm[j] * e_corr;
         let inc_min = if ptra <= 1.0 { ptra.acos() } else { PI / 2.0 };
@@ -263,15 +428,45 @@ pub fn lnz_teb(
             companion_fluxratio: &vec![0.0; nm],
             companion_is_host,
         };
-        let out = batch_eb_transit_lnl(
-            time,
-            flux,
-            sigma,
-            u1,
-            u2,
-            &masked(&fluxratios_eb, &mask_eb),
-            &params,
-        );
+        let out = if let Some(pf) = fold {
+            let mks = params.ks;
+            let porb = params.p_orbs;
+            let inc = params.incs_rad;
+            let axes = params.a_rs;
+            let ecc = params.eccs;
+            let ws = params.ws_rad;
+            batch_eb_transit_lnl_prod(
+                pf,
+                sigma,
+                mks,
+                &masked(&fluxratios_eb, &mask_eb),
+                porb,
+                inc,
+                axes,
+                ecc,
+                ws,
+                &vec![u1; nm],
+                &vec![u2; nm],
+                params.companion_fluxratio,
+                companion_is_host,
+                true,
+                false,
+                true,
+                &vec![u1; nm],
+                &vec![u2; nm],
+            )
+            .0
+        } else {
+            batch_eb_transit_lnl(
+                time,
+                flux,
+                sigma,
+                u1,
+                u2,
+                &masked(&fluxratios_eb, &mask_eb),
+                &params,
+            )
+        };
         probes.dispatched("EB", &out);
         let mut it = out.iter();
         for j in 0..n {
@@ -295,15 +490,39 @@ pub fn lnz_teb(
             companion_fluxratio: &vec![0.0; nm],
             companion_is_host,
         };
-        let out = batch_eb_transit_lnl(
-            time,
-            flux,
-            sigma,
-            u1,
-            u2,
-            &masked(&fluxratios_eb, &mask_twin),
-            &params,
-        );
+        let out = if let Some(pf) = fold {
+            batch_eb_transit_lnl_prod(
+                pf,
+                sigma,
+                params.ks,
+                &masked(&fluxratios_eb, &mask_twin),
+                params.p_orbs,
+                params.incs_rad,
+                params.a_rs,
+                params.eccs,
+                params.ws_rad,
+                &vec![u1; nm],
+                &vec![u2; nm],
+                params.companion_fluxratio,
+                companion_is_host,
+                true,
+                false,
+                true,
+                &vec![u1; nm],
+                &vec![u2; nm],
+            )
+            .0
+        } else {
+            batch_eb_transit_lnl(
+                time,
+                flux,
+                sigma,
+                u1,
+                u2,
+                &masked(&fluxratios_eb, &mask_twin),
+                &params,
+            )
+        };
         probes.dispatched("twin EB", &out);
         let mut it = out.iter();
         for j in 0..n {
@@ -334,6 +553,54 @@ pub fn lnz_ptp(
     n: usize,
     _u1: f64,
     _u2: f64,
+) -> f64 {
+    lnz_ptp_impl(
+        rng, probes, time, flux, sigma, p_orb, star, n, _u1, _u2, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn lnz_ptp_with_fold(
+    rng: &mut FppRng,
+    probes: &mut Probes,
+    time: &[f64],
+    flux: &[f64],
+    sigma: f64,
+    p_orb: f64,
+    star: &StarParams,
+    n: usize,
+    u1: f64,
+    u2: f64,
+    fold: &ProdFold<'_>,
+) -> f64 {
+    lnz_ptp_impl(
+        rng,
+        probes,
+        time,
+        flux,
+        sigma,
+        p_orb,
+        star,
+        n,
+        u1,
+        u2,
+        Some(fold),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lnz_ptp_impl(
+    rng: &mut FppRng,
+    probes: &mut Probes,
+    time: &[f64],
+    flux: &[f64],
+    sigma: f64,
+    p_orb: f64,
+    star: &StarParams,
+    n: usize,
+    _u1: f64,
+    _u2: f64,
+    fold: Option<&ProdFold<'_>>,
 ) -> f64 {
     let m_s = star.m_s;
     let qs_comp = sample_q_companion(rng, n, m_s);
@@ -376,21 +643,40 @@ pub fn lnz_ptp(
     );
 
     let comp_fr = np_median(&fluxratios_comp);
-    lnz_ttp(
-        rng,
-        probes,
-        time,
-        flux,
-        sigma,
-        p_orb,
-        star,
-        n,
-        u1_c,
-        u2_c,
-        comp_fr,
-        true,
-        Some("_lnZ_TTP"),
-    )
+    if let Some(pf) = fold {
+        lnz_ttp_with_fold(
+            rng,
+            probes,
+            time,
+            flux,
+            sigma,
+            p_orb,
+            star,
+            n,
+            u1_c,
+            u2_c,
+            comp_fr,
+            true,
+            Some("_lnZ_TTP"),
+            pf,
+        )
+    } else {
+        lnz_ttp(
+            rng,
+            probes,
+            time,
+            flux,
+            sigma,
+            p_orb,
+            star,
+            n,
+            u1_c,
+            u2_c,
+            comp_fr,
+            true,
+            Some("_lnZ_TTP"),
+        )
+    }
 }
 
 /// `_lnZ_PEB` — EB around the physical companion; returns (PEB, PEBx2P).
@@ -407,16 +693,24 @@ pub fn lnz_peb(
     u1: f64,
     u2: f64,
 ) -> (f64, f64) {
-    let m_s = star.m_s;
-    let qs_comp = sample_q_companion(rng, n, m_s);
-    probes.sampler("_sample_q_companion", &qs_comp);
-    let masses_comp: Vec<f64> = qs_comp.iter().map(|&q| q * m_s).collect();
-    let flux_comp = flux_relation(&masses_comp);
-    let flux_ms = flux_relation(&[m_s])[0];
-    let fluxratios_comp: Vec<f64> = flux_comp.iter().map(|&f| f / (f + flux_ms)).collect();
+    lnz_peb_impl(rng, probes, time, flux, sigma, p_orb, star, n, u1, u2, None)
+}
 
-    let comp_fr = np_median(&fluxratios_comp);
-    lnz_teb(
+#[allow(clippy::too_many_arguments)]
+pub fn lnz_peb_with_fold(
+    rng: &mut FppRng,
+    probes: &mut Probes,
+    time: &[f64],
+    flux: &[f64],
+    sigma: f64,
+    p_orb: f64,
+    star: &StarParams,
+    n: usize,
+    u1: f64,
+    u2: f64,
+    fold: &ProdFold<'_>,
+) -> (f64, f64) {
+    lnz_peb_impl(
         rng,
         probes,
         time,
@@ -427,10 +721,67 @@ pub fn lnz_peb(
         n,
         u1,
         u2,
-        comp_fr,
-        true,
-        Some("_lnZ_TEB"),
+        Some(fold),
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lnz_peb_impl(
+    rng: &mut FppRng,
+    probes: &mut Probes,
+    time: &[f64],
+    flux: &[f64],
+    sigma: f64,
+    p_orb: f64,
+    star: &StarParams,
+    n: usize,
+    u1: f64,
+    u2: f64,
+    fold: Option<&ProdFold<'_>>,
+) -> (f64, f64) {
+    let m_s = star.m_s;
+    let qs_comp = sample_q_companion(rng, n, m_s);
+    probes.sampler("_sample_q_companion", &qs_comp);
+    let masses_comp: Vec<f64> = qs_comp.iter().map(|&q| q * m_s).collect();
+    let flux_comp = flux_relation(&masses_comp);
+    let flux_ms = flux_relation(&[m_s])[0];
+    let fluxratios_comp: Vec<f64> = flux_comp.iter().map(|&f| f / (f + flux_ms)).collect();
+
+    let comp_fr = np_median(&fluxratios_comp);
+    if let Some(pf) = fold {
+        lnz_teb_with_fold(
+            rng,
+            probes,
+            time,
+            flux,
+            sigma,
+            p_orb,
+            star,
+            n,
+            u1,
+            u2,
+            comp_fr,
+            true,
+            Some("_lnZ_TEB"),
+            pf,
+        )
+    } else {
+        lnz_teb(
+            rng,
+            probes,
+            time,
+            flux,
+            sigma,
+            p_orb,
+            star,
+            n,
+            u1,
+            u2,
+            comp_fr,
+            true,
+            Some("_lnZ_TEB"),
+        )
+    }
 }
 
 /// Sequential-order finite sum used by the golden dispatch probes.

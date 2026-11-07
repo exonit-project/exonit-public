@@ -1,14 +1,14 @@
 """Plan queue and continuity policy (phase 1 — shadow mode).
 
-`plans.yaml` is the human source of truth of the autonomous loop: an
-ordered queue of plans, not a single plan (spec §4.1). This module only reads
-and interprets the queue — it touches neither the infra nor the server.
+`plans.yaml` is the human source of truth for the autonomous loop: an ordered
+queue of plans, not a single plan (spec §4.1). This module only reads and
+interprets the queue — it touches neither the infra nor the server.
 
-A plan without `approved_by` is loaded anyway (no error is raised) but
-is never returned as executable from `current_plan`: the supervisor does not
-execute anything the operator has not explicitly approved.
+A plan without `approved_by` is still loaded (no error is raised) but is
+never returned as executable from `current_plan`: the supervisor executes
+nothing that the operator has not explicitly approved.
 
-When the queue runs out with no pending approved plan, `continuity_decision`
+When the queue runs out with no approved plan pending, `continuity_decision`
 applies the escalation approved in §4.6 so the system never stops to wait for
 a decision.
 """
@@ -31,7 +31,7 @@ class Plan:
     max_lots: Optional[int] = None
     fleet_profile: str = "full"
     notes: str = ""
-    total_tics: Optional[int] = None  # filled in by the supervisor once known
+    total_tics: Optional[int] = None  # filled in by the supervisor once it knows it
 
     @property
     def approved(self) -> bool:
@@ -52,7 +52,7 @@ class ContinuityDecision:
 
 
 def load_plans(path) -> PlansFile:
-    """Read `plans.yaml`. Plans without `approved_by` are loaded anyway
+    """Read `plans.yaml`. Plans without `approved_by` are still loaded
     (Plan.approved stays False) — they never raise an error on load."""
     path = Path(path)
     with path.open("r") as f:
@@ -79,12 +79,12 @@ def load_plans(path) -> PlansFile:
 
 
 def current_plan(pf: PlansFile, completed_plan_ids: set) -> Optional[Plan]:
-    """First approved plan not yet completed.
+    """First approved plan that is not completed.
 
-    The queue is sequential (§4.1): already-completed plans are skipped, but if
-    the first non-completed plan is not yet approved, the queue is
-    blocked here (a later, already-approved plan is not jumped to out of
-    order) and None is returned.
+    The queue is sequential (§4.1): we skip the already-completed plans, but
+    if the first non-completed plan is not approved yet, the queue is blocked
+    here (we do not jump to a later, already-approved plan out of order) and
+    None is returned.
     """
     for plan in pf.plans:
         if plan.plan_id in completed_plan_ids:
@@ -105,8 +105,8 @@ def plan_progress(plan: Plan, tics_done: int, lots_done: int) -> float:
 
 def needs_planning(pf: PlansFile, plan: Plan, progress: float, lots_left: Optional[int]) -> bool:
     """True if the current plan reaches ~75% (or <=2 lots remain) and the queue
-    has NO approved plan after the current one (early-planning
-    trigger, §4.1)."""
+    has NO approved plan after the current one (early-planning trigger,
+    §4.1)."""
     trigger = progress >= 0.75 or (lots_left is not None and lots_left <= 2)
     if not trigger:
         return False
@@ -128,9 +128,9 @@ def continuity_decision(
 
     1. First non-completed sector of `master_list` that passes the space
        gate (`space_ok`).
-    2. If none: `deep_rescan` of the sector in `sectors_with_data` with the lowest
-       deep coverage (0.0 by default if absent from `deep_coverage`).
-    3. If that is not possible either: `pause_and_alert`.
+    2. If none: `deep_rescan` of the sector in `sectors_with_data` with the
+       lowest deep coverage (0.0 by default if absent from `deep_coverage`).
+    3. If neither: `pause_and_alert`.
     """
     for sector in master_list:
         if sector in completed_sectors:
@@ -156,5 +156,5 @@ def continuity_decision(
     return ContinuityDecision(
         kind="pause",
         sector=None,
-        reason="no new sector with space nor a sector with data for deep rescan",
+        reason="no new sector with space and no sector with data for deep rescan",
     )

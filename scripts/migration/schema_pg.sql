@@ -113,7 +113,7 @@ CREATE TABLE candidates (
     exominer_tce_period       DOUBLE PRECISION,
     exominer_sector_run       TEXT,
     -- exominer_status (docs/superpowers/specs/exominer-status-column.md,
-    -- "Step 2", 2026-07-14): additive state column alongside exominer_score
+    -- "Pas 2", 2026-07-14): additive state column alongside exominer_score
     -- (unchanged, -1 sentinel and all). On the already-migrated production
     -- DB this column is added + backfilled by
     -- scripts/migrate_exominer_status.py, NOT by re-running this file (see
@@ -141,6 +141,44 @@ CREATE TABLE candidates (
     -- postgres): ALTER TABLE candidates ADD COLUMN IF NOT EXISTS
     -- verdict_proba DOUBLE PRECISION; -- BEFORE deploying the server code.
     verdict_proba             DOUBLE PRECISION,
+    -- Fixed FPP model (plan 2026-10-15, step 6): additive nullable columns. On the
+    -- already-migrated production DB they are added by the DB owner with
+    -- scripts/migration/2026-10-17_fpp_model_columns.sql BEFORE the server deploy
+    -- (it also builds the recompute partial index CONCURRENTLY; the optional cnn-NULL queue indexes are in 2026-10-17_fpp_cnn_null_indexes.sql).
+    fpp_model_version         SMALLINT,
+    triceratops_fpp_v1        DOUBLE PRECISION,
+    triceratops_nfpp_v1       DOUBLE PRECISION,
+    fpp_scen                  JSONB,
+    fpp_backend               TEXT,
+    fpp_backend_device        TEXT,
+    fpp_mc_se                 DOUBLE PRECISION,
+    fpp_n_draws               BIGINT,
+    nfpp_mc_se                DOUBLE PRECISION,
+    fpp_n_draws_total         BIGINT,
+    mc_min_ess                DOUBLE PRECISION,
+    mc_borderline             BOOLEAN,
+    mc_detail                 JSONB,
+    population_version        TEXT,
+    population_source         TEXT,
+    population_sha256         TEXT,
+    fpp_flags                 TEXT,
+    -- model >= 3 (FFI geometry v3): scripts/migration/2026-10-18_fpp_geometry_columns.sql
+    geometry_version          SMALLINT,
+    dilution_convention       TEXT,
+    aperture_source           TEXT,
+    depth_scale               DOUBLE PRECISION,
+    -- ephemeris refinement provenance: scripts/migration/2026-10-30_fpp_ephem_columns.sql
+    ephem_status              TEXT,
+    ephem_reason              TEXT,
+    ephem_period_days         DOUBLE PRECISION,
+    ephem_t0                  DOUBLE PRECISION,
+    ephem_shift_h             DOUBLE PRECISION,
+    ephem_delta_chi2          DOUBLE PRECISION,
+    -- FPP switch set + legacy verdict: scripts/migration/2026-10-31_fpp_switches_verdict_v1.sql
+    fpp_switches              JSONB,
+    triceratops_verdict_v1    TEXT,
+    -- alias phase-2 provenance: scripts/migration/2026-11-02_harmonic_epoch_class.sql
+    harmonic_epoch_class      BOOLEAN,
     exominer_ffi_score        DOUBLE PRECISION,
     exominer_ffi_model_version TEXT,
     cross_source_name         TEXT,
@@ -235,7 +273,7 @@ CREATE INDEX idx_cand_em_todo_tic ON candidates (tic_id)
     WHERE exominer_score IS NULL AND cnn_score >= 0.7;
 
 -- idx_cand_exominer_status_todo (docs/superpowers/specs/exominer-status-
--- column.md, "Step 2"): same shape as idx_cand_exominer_todo above, keyed on
+-- column.md, "Pas 2"): same shape as idx_cand_exominer_todo above, keyed on
 -- the new status column. Not read by any production query yet in this
 -- iteration — see progress/impl-exominer-status.md. On the live production
 -- DB this index is created by scripts/migrate_exominer_status.py (after its
@@ -297,7 +335,7 @@ ALTER SEQUENCE candidates_id_seq OWNED BY candidates.id;
 -- run_id (S3, docs/superpowers/specs/2026-09-26-enqueue-s1-s4-design.md
 -- §3.2): the LOT's run identity at enqueue time — replaces
 -- discovery_run_tics as the scoping source for a run's TIC set (see that
--- table's own comment below; NOT dropped by this migration — operator
+-- table's own comment below; NOT dropped by this migration — the owner's
 -- decision §9.2). NULL = unattributed (enqueued outside a --run-id-aware
 -- path, e.g. a manual enqueue_from_csv.py without --run-id — adoptable by
 -- S4, out of scope for any run). On the already-migrated production DB this
@@ -537,7 +575,7 @@ CREATE INDEX IF NOT EXISTS idx_no_data_sector ON discovery_no_data(sector);
 -- attempts: LOT-level TERMINAL failures for this (tic, sector) — NOT the
 -- same counter as tasks.attempts (worker-level retries within one lot,
 -- capped at db.MAX_TASK_ATTEMPTS=3). exhausted(t,S) is
--- attempts >= done_state.MAX_LOTS_PER_SECTOR (2, operator decision §7.1).
+-- attempts >= done_state.MAX_LOTS_PER_SECTOR (2, the owner's decision §7.1).
 --
 -- On the already-migrated production DB this table is created by hand
 -- (idempotent — CREATE TABLE IF NOT EXISTS), not by re-running this whole
@@ -636,31 +674,30 @@ CREATE TABLE IF NOT EXISTS discovery_runs (
 -- bucketed Parquet on MinIO; staging + exact aggregates here. Gated by
 -- EXONIT_COMPLETENESS_PG=1 (docs/superpowers/plans/
 -- 2026-07-05-phase4-completeness-parquet.md). With the flag OFF (default) the
--- SQLite sidecar (completeness/completeness_agg, this file line ~307)
+-- SQLite sidecar (completeness/completeness_agg, this file ~line 307)
 -- stays intact; these 3 tables remain empty and unused.
 --
 -- completeness_staging: append-only write path (POST /api/worker/result ->
--- ExoNitDB.add_completeness_many). NO on-conflict/unique — the same
+-- ExoNitDB.add_completeness_many). NO on-conflict/unique -- the same
 -- (tic_id, radius_earth, period_days) may appear more than once between
 -- compactions; last-write-wins by written_at/id is the compaction's job
 -- (Task 3), not this write path's.
 --
--- completeness_tics: compacted index of already-processed TICs (tic_id -> bucket
--- crc32(tic_id)%256, see exonit/completeness_store.bucket_of), for an exact
--- distinct-count without scanning Parquet (ExoNitDB.
--- count_completeness_tics, combined with any tic still only in
--- staging).
+-- completeness_tics: compacted index of already-processed TICs (tic_id ->
+-- bucket crc32(tic_id)%256, see exonit/completeness_store.bucket_of), for an
+-- exact distinct-count without scanning Parquet (ExoNitDB.
+-- count_completeness_tics, combined with any tic still only in staging).
 --
--- completeness_agg_bucket: aggregate per (bucket, radius_earth, period_days) —
--- ALWAYS recomputed whole per bucket at compaction (never deltas), because
--- compaction does last-write-wins by PK and fragile deltas would not
--- capture that correctly. The reader (ExoNitDB.query_completeness_agg) does
--- SUM(sum_prob)/SUM(n) grouped by cell, summing across buckets — the
--- bucket partition is a write-side detail invisible to readers.
+-- completeness_agg_bucket: aggregate per (bucket, radius_earth, period_days)
+-- -- ALWAYS recomputed whole per bucket at compaction (never deltas), because
+-- compaction does last-write-wins by PK and fragile deltas would not capture
+-- that correctly. The reader (ExoNitDB.query_completeness_agg) does
+-- SUM(sum_prob)/SUM(n) grouped by cell, summing across buckets -- the
+-- per-bucket partitioning is a write-side detail invisible to readers.
 --
--- ExoNitDB._ensure_completeness_pg_schema() creates these 3 tables
--- in code (CREATE TABLE IF NOT EXISTS) in addition to here, so that a fresh PG DB
--- (e.g. exonit_test) has them without a separate provisioning step.
+-- ExoNitDB._ensure_completeness_pg_schema() creates these 3 tables in
+-- code (CREATE TABLE IF NOT EXISTS) in addition to here, so that a fresh PG
+-- DB (e.g. exonit_test) has them without a separate provisioning step.
 CREATE TABLE IF NOT EXISTS completeness_staging (
     id             BIGSERIAL        PRIMARY KEY,
     tic_id         TEXT             NOT NULL,
@@ -714,7 +751,7 @@ CREATE TABLE IF NOT EXISTS completeness_agg_bucket (
 --
 -- S3 (docs/superpowers/specs/2026-09-26-enqueue-s1-s4-design.md §3): being
 -- REPLACED by tasks.run_id as the scoping source (db.run_scope_kind,
--- EXONIT_RUN_SCOPE) — this table is NOT dropped by S3 itself. Operator
+-- EXONIT_RUN_SCOPE) — this table is NOT dropped by S3 itself. the owner's
 -- decision §9.2: drop only after (i) the done-state backfill is complete,
 -- (ii) >=2 lots have run with EXONIT_RUN_SCOPE=tasks AND
 -- EXONIT_RUN_TICS_WRITE=0, and (iii) a `pg_dump -t discovery_run_tics`

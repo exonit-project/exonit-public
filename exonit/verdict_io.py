@@ -58,6 +58,25 @@ CANDIDATE_FIELDS = (
 )
 
 
+#: FPP-model gate columns (FPP fix plan step 6 (v), ``exonit.fpp_model``). Not part of the
+#: classifier feature set: ``predict_verdict`` consumes them in ``gate_candidate_for_verdict``
+#: (a new-model row must reach the classifiers with its LEGACY FPP, never the new one).
+#: Passed through when the row has them; a row without them is a legacy-model row.
+GATE_FIELDS = ("fpp_model_version", "triceratops_fpp_v1", "triceratops_nfpp_v1")
+
+
+def with_gate_fields(candidate: Mapping, source: Optional[Mapping] = None) -> dict:
+    """Copy of *candidate* with the FPP-model gate columns made EXPLICIT: taken from *source*
+    (default: *candidate* itself) when present, else None (= a legacy-model row). For callers
+    that build the classifier input from a worker body / synthetic dict rather than a DB row
+    (offline replays, the injection runner), so the gate sees the same keys on every path."""
+    src = candidate if source is None else source
+    out = dict(candidate)
+    for k in GATE_FIELDS:
+        out[k] = src.get(k) if k in src else out.get(k)
+    return out
+
+
 def build_star_info(tic_id, star_row: Optional[Mapping]) -> dict:
     """Build the ``star_info`` dict ``predict_verdict`` expects.
 
@@ -109,6 +128,7 @@ def build_candidate_dict(row: Mapping) -> dict:
         "tic_id": str(row["tic_id"]),
         "candidate_num": int(row["candidate_num"]),
         **{k: row[k] for k in CANDIDATE_FIELDS if k in row},
+        **{k: row[k] for k in GATE_FIELDS if k in row},
     }
 
 

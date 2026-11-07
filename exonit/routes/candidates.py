@@ -351,7 +351,7 @@ def register(app, deps: ServerDeps) -> None:
 
         # Check NFS mount
         import shutil
-        nfs_path = cfg.nfs_cache_path
+        nfs_path = "/data/tess_cache"
         nfs_available = os.path.isdir(nfs_path)
         nfs_usage = {}
         if nfs_available:
@@ -492,7 +492,7 @@ def register(app, deps: ServerDeps) -> None:
         def _rebuild():
             cache = MetadataCache(cfg.metadata_cache_path)
             try:
-                return build_from_nfs(cache, cfg.nfs_cache_path)
+                return build_from_nfs(cache, "/data/tess_cache")
             finally:
                 cache.close()
 

@@ -1,5 +1,161 @@
 # Changelog
 
+## sync 2026-11-07 (internal 18959ec)
+- feat(alias): per-candidate harmonic_epoch_class provenance column, config-null/strict-bool hardening, wiring tests
+- feat(alias): server dispatches harmonic_epoch_class to workers (EXONIT_HARMONIC_EPOCH_CLASS)
+- fix(fpp): strict legacy parity=None env parse; refuse golden/gate/harness runs with stray switch env
+- feat(fpp): Python honours FPP_EPHEM_REFINE / FPP_UNSTABLE_FLAG env vars (on/off, typed error) like Rust/Swift
+- feat(fpp): persist fpp_switches per result (D17) + triceratops_verdict_v1 saved on arming, restored on disarm/rollback (P2)
+- fix(fpp-galaxia): health 503 leaks no paths, forced-revalidate test, stale patch target, 60 s note
+- feat(fpp-galaxia): fail-closed revalidation, /api/health/fpp_population, prefetch refusal under the store switch, provenance + real-mount tests
+- feat(fpp): fpp_unstable honesty flag (FPP_UNSTABLE_FLAG)
+- feat(fpp-recompute): --fleet-verified gate, recount pending every N batches, armed-index proposal (not applied); handoff: readers of NULL FPP, EXPLAIN step, fleet check
+- fix(fpp-queue): dashboard listing and veto check never reap the backfill hold (review B1); display window follows the ceilings
+- fix(fpp-background route): resolve current_population_version at call time (import-time binding leaked a monkeypatch across tests, review N1)
+- feat(worker): Python worker posts the ephem_* provenance (same keys as the Rust/Swift DTOs)
+- feat(fpp): server-side ingestion of ephemeris-refinement provenance (feature-detected) + unapplied migration 2026-10-30
+- feat(fpp-queue): env-configurable FPP hold ceiling, visibility and deliveries (defaults unchanged); ceiling > 1800 s no longer capped by the backfill_tic reaper
+- feat(fpp): enqueue_fpp_recompute.py arms old FPP results for the v3 recompute (dry-run default, PAUSED-aware)
+- feat(fpp-galaxia): refuse serving the store unless dir, index, manifest and a probe TIC are consistent
+- fix(tests): IR ring-model tests import the 100-ring kernel from the step-2 test oracle (it left fpp_native)
+- fix(tests): pin the worker package in sys.modules so test order cannot shadow it (test_fpp_mc_columns ImportError)
+- feat(fpp): galaxia store index post-build verify script (+smoke test)
+- feat(fpp): v3 gate reference run - parallel resumable driver, 1e6 selection rule, step-7 escalation record, gate profile, streaming dumps, contacts on every draw
+- fix(fpp): refuse population without sha256/version provenance (population_invalid, Swift parity)
+- feat(fpp): v3 cross-platform gate staging - held-out input staging, glibc reference dump generator, v3 comparator
+- feat(fpp): 100-star FPP A/B on the production ephemeris (FPP_EPHEM_REFINE off vs on), prepared, not launched
+- feat(fpp): serve populations from the materialized galaxia-rs store (read-only parts + TIC index)
+- fix(fpp): population-by-tic review notes 1-3
+- feat(fpp): serve Galaxia population by TIC within a configured family (decision D2)
+- fix(fpp): ephem refine review round 1 — stored row on both paths (R1), cadence-aware coverage + exposure-integrated template (R2), period freed only on a 3-sigma gain + bounded insignificant shifts (R3), t0 window cap, required t0_convention
+- feat(fpp): calc_fpp_by_source seed_ephemeris; worker in-task FPP seeds from the stored (rounded) row like backfill
+- fix(fpp): keep ephem_* out of the posted model fields (server drops them), log them instead; tests pass t0_convention
+- feat(fpp): deterministic bounded (P, t0) refinement of the box-start BLS ephemeris before FPP (FPP_EPHEM_REFINE)
+- feat(fpp): task 26 S5 route tests + one-time warning when MC columns are missing (Qwen drafted; Claude fixed stray blank lines in db.py and a no-op assert)
+- feat(fpp): task 26 S4 DDL artefacts (NOT APPLIED) for step-7 MC columns (Qwen drafted; Claude added the throwaway-cluster UPDATE check)
+- feat(fpp): task 26 S3 worker maps step-7 MC fields via one helper at both sites (Qwen drafted; accepted as is)
+- feat(fpp): task 26 S2 JSONB cast for mc_detail + SQLite/PG-dialect tests (Qwen drafted; accepted as is)
+- feat(fpp): task 26 S1 server contract for step-7 MC fields (Qwen drafted; Claude added bool guard)
+- feat(fpp): step 7 decision C - cap 1e6 total draws, dominant-ESS futility stop, report/handoff corrections
+- feat(fpp): step 7 MC-noise sequential refinement (adaptive N), estimator, tests, measurement and report
+- fix(fpp): review round 1 - cache original TIC values, giant_host flag+cap, relation failure handling and health status, deterministic refit
+- feat(fpp): giant_host classification, pinned TIC-v8-fitted Teff/R mass relation for dwarfs, reason-carrying gate; report+handoff
+- fix(fpp): shared bounded host-mass derivation for /api/nearby cache+live paths, mass_source provenance, explicit stellar_params_missing skip reason stored and countable
+- feat(fpp): 100-star harness uses served rs documents unchanged, production seed + 1,2, TOI-catalog shards, coords_source
+- fix(fpp): accept served Galaxia documents from galaxia-rs 0.2.2 (C++ parity approved) with the same mapping checks; other generators still refused
+- feat(fpp): offline 100-star FPP harness with galaxia-rs population (staging, materialize, runner, tests, 3-TOI smoke)
+- feat(galaxia-fleet): parse the galaxia-rs >= 0.2.2 --version line ("galaxia-rs X.Y.Z (git sha) backend=cpu-fp64 ..."), refuse -dirty builds; family galaxia-rs-0.2.2
+- feat(galaxia-fleet): --rs-threads N (galaxia-rs --threads, one resident load shared), slice default max(100, 25N), whole-core-list pinning, tests with out-of-order lines
+- feat(galaxia-fleet): rs gate uses 7 GB resident (measured 6.5 GB peak), --min-avail-gb on golden\/conformance\/verify-sample, runner stops on a family-refused shard, runbook, handoff
+- feat(galaxia-fleet): memory gate floor of the rs engine includes the ~6 GB resident data of the new batch process
+- feat(galaxia-fleet): --engine rs in the runner, coordinator family guard, rs-aware merge/materialize/conformance, CLI + tests
+- feat(galaxia-fleet): galaxia-rs engine module (EBF reader, version class, fp64 proof, batch process with slices/retries/stall guard) + fake binary for tests
+- feat(fpp): validate the TGLC 3x3 box path after the passed v3 run, near-edge and unknown NEAREDGE stay candidate, FFI reference only for TGLC box with K-epoch cache (item 5)
+- fix(fpp): FFI WCS body LRU holds 64 sectors, above the 28 measured for one TIC (review R4)
+- fix(fpp): lock and snapshot the header-read counters so an abandoned build cannot break the outcome record (review R3)
+- fix(fpp): header reads use a dedicated short-timeout client and a circuit breaker for a stalled store (review R2)
+- feat(fpp): read TGLC/QLP headers of packed MinIO members for the task geometry, 2 s budget, memoised WCS cache
+- fix(fpp): geometry-node failure has its own skip reason, drop the dead handler (review N3)
+- fix(fpp): parked fields no longer stall the FPP drain (review N1)
+- feat(fpp): serve the real product geometry in the FPP task payload (review N2)
+- fix(fpp): Kepler domain clamp for reduced M, demote validated on kepler_unconverged_draws, handoff corrections
+- feat(galaxia-fleet): N1 DB-strong TICs with NULL FPP join the scope as tier 1 (read-only export, coords from stars); runbook inputs v2
+- feat(galaxia-fleet): priority tiers (0 validation, 1 strong/finalist, 2 TOI, 3 S1, 4 rest), per-tier status and ETA, tier export (read-only), runbook + handoff for review round 2
+- fix(galaxia-fleet): a starved runner still obeys the STOP file (memory gate polls it)
+- fix(galaxia-fleet): review F1-F6 -- store shard before done, persistent merge record, remote-launch builder, memory gate, runner lock, heartbeat during upload, TAP timeout, local bundle
+- feat(galaxia-fleet): runbook, verify-sample, merge --delete-merged, Gaia re-plan coverage, fixes
+- feat(galaxia-fleet): Gaia cell-count R8 pre-step, coordinate export, sizing sample, old-vs-new proof, Windows/Unix provisioning
+- feat(fpp-background): raw Galaxia store, platform-tagged population_version, portable tree hash, fleet coordinator/runner/merge
+- fix(fpp): safeguarded Kepler solver (bracket + bisection) with per-draw convergence count
+- fix(verdict): ingest-time verdict reads cnn_score from the stored row (IR pilot finding 6)
+- feat(release): script to withhold FPP values from the public results repo, with tests
+- feat(fpp): step 4 - D6 S family (STP, SEB, SEBx2P): per-draw LDC, capped stellar relations, array sample_rp, grouped kernels, Roche mask, calc_fpp_native wiring
+- feat(fpp): fresh-sample validation script for the reference-FFI WCS (list stage; validate refuses without the W2 confirmation)
+- fix(fpp): geometry_source in the result; ffi_reference sectors are never validated (W1)
+- feat(fpp): reference-FFI WCS measurement (drift vs SPOC), drift gate option, real-header tests, handoff for review round 1
+- feat(fpp): server-side reference-FFI WCS cache (header Range reads, drift statistic, local TAN) and the ffi_reference geometry source
+- fix(fpp): legacy TRILEGAL pseudo-stars at the target position get no nearby-star scenarios
+- fix(fpp): partial real geometry is capped (geometry_coverage), real-WCS bound enforced at the claimed 1e-12
+- fix(fpp): ship fpp_gl_tables.json in the worker manifest (by name), FPP unavailable instead of a crash when the table is missing or corrupt
+- fix(fpp): QR-fit conditioning flag (sigma_fit_ill_conditioned caps the verdict), GL table pinned by sha256 and regenerated correctly rounded from mpmath
+- feat(fpp): f32 emulations for Metal iterations p3 (switch-cut side flag, f32 node placement) and p4 (Pi n<0 characteristic transformation)
+- feat(fpp): f32 NumPy emulation of the Metal orbit (plan 10a(2)): current design vs A-prime vs A-prime + switch cuts
+- fix(fpp): deterministic Householder QR for the q' phase-curve fit, Gauss-Legendre tables as committed data
+- fix(fpp): gate columns explicit in replay_server and injection runner predict_verdict calls; schema filter in recompute_verdict._cand_cols
+- fix(fpp): step 6 review round 1 - refuse new-model FPP without the DDL, verdict gate on every path (recompute, primary), cnn-NULL indexes in own file, read-only widening script, refresh 2 stale snapshot tests
+- feat(fpp): step 6 code - model columns migration (not applied), server stores new FPP fields, task payload extras, verdict gate, cnn-NULL FPP queue arm (flag), recompute/_n partial indexes
+- fix(fpp): step 5 review round 1 - cc1 Tmag correction (versioned, parity switch), R8 3-sigma rule + Gaia TAP wiring, explicit route version, loud reproducibility failures, plan amendment A5-A8
+- feat(fpp): step 5 - Galaxia pinned install runbook, validation (30 fields), R8 direction, handoff
+- feat(fpp): step 5 - fpp_background migration (not applied), ebf reader, prefetch CLI
+- feat(fpp): step 5 - fpp_background population service (Galaxia generate/map/cache), GET /api/fpp_background/{tic}, batch prefetch
+- feat(fpp): step 3 - D5 flux-ratio model (libm erf, all viable neighbours, N draws) and real per-sector WCS geometry
+- fix(fpp): step-2 review nits - plan sigma-effect wording (not always up), R7-2 script refuses fixtures without sha256, companion no-op tests made live
+- fix(fpp): step-2 review round 1 - R7-2 on 30 TOIs, handoff; replay 258/258 with the Carlson kernel
+- fix(fpp): review findings 3,6,7 - elliptic integrals by Carlson R_F/R_C/R_J (cel replaced), kc->0 / kc->1 tests, sigma_components sort instead of per-bin masks, bench scripts point to the ring oracle, sigma/fold cost in the benchmark
+- fix(fpp): review finding 1 - unusable raw LC is a skip (raw_lc_unusable), pre-folded path only with allow_prefolded, verdict capped when sigma_source != q_prime; duplicate clip removed
+- feat(fpp): step 2 complete - ring kernel moved to the test oracle, R7-2 sigma-effect script, handoff
+- feat(fpp): nearby_lnz_offset (FPP_NORM), production-path tests, cadence benchmark script; adapter production FPP_NORM stays upstream pending decision (r) criteria
+- feat(fpp): calc_fpp_native production path (mean-bin fold, per-bin q' sigma, ladder likelihood), parity scalar sigma_oot, FPP_NORM data switch, exposure flags in the result
+- feat(fpp): production fold object + renorm; _lnZ_* production branch (fold=) with exposure diagnostics
+- feat(fpp): production batch lnL kernels on the bin ladder (planet + EB, composed affine dilution, secondary veto first)
+- feat(fpp): production bin ladder (quantile nodes, contact-split GL) - production exposure T3 fixtures flip
+- feat(fpp): contact-split Gauss-Legendre exposure window integrator + order choice; parity exposure uses batman node placement; per-case PyTransit validity measured on carrying draws (union), replay xfail markers retired
+- feat(fpp): D15 production likelihood sigma components (q') bit-exact vs golden
+- feat(fpp): production fold (mean bins, bin phase distribution, type-7 quantile spec) bit-exact vs goldens (N5)
+- feat(fpp): exact contact times (t1..t4, t_min) of the Kepler separation; golden 1e-9 d met (worst 3.7e-13)
+- feat(fpp): batch lnL kernels - per-bin sigma, exposure args, D3 twin without secondary cut, D4 secondary eclipse (upstream/consistent geometry), D10c k nudge switch
+- feat(fpp): GPU dispatch removed from fpp_native (CPU-only by design, decision (e)); kernel modules left on disk
+- feat(fpp): D10 light-curve core (_lc_core) with analytic kernel + parity 2min x20 exposure; Gate A / T3 max flip (0.57 nat)
+- feat(fpp): D10a analytic Mandel-Agol quadratic-LD kernel (clean-room, Bulirsch cel, atan2 contact geometry); kernel fixtures flip
+- feat(fpp): Bulirsch cel (clean-room) + K/E/Pi helpers, tested vs scipy
+- fix(fpp): D1 eccentric transit centre + D2 spurious phase-0.5 dip in _compute_z_arr; geometry fixtures flip
+- feat(fpp): N2/U9 q-branch switch (FPP_Q_BRANCH upstream|correct); parity q fixtures flip
+- feat(fpp): switch set (FPP_PARITY umbrella, per-switch overrides), FPP_MODEL_VERSION=2 stored with every result
+- fix(fpp): N3 fail-loud limb darkening (LDCTableMissing / LDCNoRow, skip_reason) + tests
+- fix(fpp): N1 astropy hex-float constants block + import-time check; lnprior_bound bit-exact fixtures flip
+- feat(worker): vetting_oddeven_significance flag (odd/even depth-difference sigma with red-noise beta, centred windows), default OFF bit-identical; harness arms off/cent/sig/sigc
+- feat(worker): vetting_oddeven_centre_t0 flag (odd-even only at t0 + dur/2), default OFF bit-identical; real-EB runner
+- feat(worker): vetting_centre_t0 flag (physics vetting at t0 + dur/2; record and model inputs untouched), default OFF bit-identical
+- feat(ab): per-planet gains in eval_ab, merge_arm, replay loop_fixes A + two-planet injection
+- feat(ab): arm mode (--cfg/--label) for multiplanet-loop-fixes A/B, sweep_tics
+- feat(worker): multiplanet_loop_fixes flag (A centre t0 at the 3 duration_refine sites, B sweep same-signal), default OFF bit-identical
+- feat(ab): G6b (top matches any catalog planet of the host) + per-planet loss lines in eval_ab, strict G6 kept
+- fix(alias-2p): one veto mode fleet-wide (config key removed, unknown mode rejected), vh = span*2e-4 > duration with derivation, discriminating vh tests + boundary
+- fix(veto-v2): physical T0 null (NNLS start-time deconvolution), calibration on inside cells only, late-start tests, round-2e validation
+- fix(veto-v2): test every populated T0 cell (outside-class-window null), hole probe, round-2d validation
+- fix(veto-v2): round-2 review items: discriminating regression test, visible shadow failures (orchestrator WARNING), symmetric pool, calibration+cost in JSON, long-period T0 null (alive-bin support min(P,L_s)); re-validation
+- fix(phys-sanity): TGLC depth-corr review round 1 - IR replay forces correction off, FFI-fallback rows (tasks.lc_load_recovered) left uncorrected, committed NEAREDGE snapshot cited by sha256, widened partial/unchecked error, cache warnings
+- feat(alias-2p): hybrid demotion veto 'vh' (v0 on short baselines, v1 when span > 5000*dur) as default; low-SNR FFI injection arm, variant harness
+- feat(phys-sanity): TGLC depth correction at consumption (c=1.09, near-edge 1.27 provisional), lc_source from metadata fits_files, NEAREDGE header cache, rp_implausible on corrected Rp; EXONIT_TGLC_DEPTH_CORR default on
+- fix(cnn): address code review - legacy model fallback, empirical ~2^-22 parity bound, withdraw v2.1 train/serve skew claim
+- fix(worker): gap_fill_detrend_only review - JSON-bool-only flag parsing (Rust/Swift parity), long-sweep frame test, rescore_cnn_ffi mirror
+- fix(cnn): pair a Core ML package only when its output name matches the ONNX; parity-test prod guard; review findings
+- fix(veto-v2): T0-event window bug (stray epochs), adjacent-class edge matching; EXONIT_VETO_V2=shadow side report; round-2b validation
+- fix(cnn): FFI sparse view -> None (FPP runs); SPOC CNN emits logit, clamped sigmoid in Python
+- feat(worker): gap_fill_detrend_only also a worker-config key (task > worker > off) so backfill FPP matches in-task FPP; heartbeat flag; IR/injection harness options
+- feat(veto-v2): T0-event cells calibrated from per-sector background; round-2 validation (KP/CP, pilot, shadow on s7/s23/s14); correct round-1 audit
+- feat(worker): gap_fill_detrend_only flag (default off) - gap-fill points only feed wotan, dropped before BLS/vetting/CNN/injection
+- fix(alias-2p): review items (V1 docstring/comments/trace reason, non-vacuous G1 test) + demotion veto modes v0/v1/v1p via harmonic_epoch_class_veto; A/B harness variant arms
+- fix(veto-v2): default OFF, NaN shape = missing, _veto_kwargs in soft count; memory + held-out validation in report
+- feat(veto): EXONIT_VETO_V2 density-excess systematic families (per-sector, T0 modes, shape bands, SNR soft tag) + validation report
+- fix(worker): gap-fill seed = FNV-1a(tic:sectors) -> RandomState (portable to Rust/Swift)
+- fix(worker): deterministic seeded fill_gaps (tic+sectors Generator) replacing unseeded lightkurve noise
+- feat(ir): pilot scorecard ir_pilot_2026-10-15 (200 inj + 100 blank + 100 inv, OFF/ON/CTRL) + cost model + blindness tests
+- feat(ir): pilot harness (hosts, injections, inv transform, loopback offline API, python arm, replay, evaluator, stage-0 checks)
+- feat(ir): injection-recovery library (exact quad-LD transit model, FITS injection, inv transform, alias/recovery classifier, stage predicates) + tests
+- fix(physical-sanity): giant_host annotation-only + giant_host_hard (R*>5) hard cut, per-candidate finalist judgement, logg column, MAST cache, retro re-run (no finalists removed)
+- fix(alias-2p): G1 promotion consistency guard + V1 veto only on positive alias evidence (WASP-164 b regression), resolver trace
+- feat(physical-sanity): Rp/T0/RUWE section in discovery dossiers, finalists drop rp_implausible/giant_host
+- feat(ab): alias-2p offline A/B harness (fixtures, tasks, Python/Swift arms, injection, eval) + runbook
+- fix(dossier-regen): lot-time exclusion on replacement keepers, never remove a row, sub-harmonic alias guard
+- feat(dossier): regenerate_dossier.py applies phase-1 harmonic filter to committed dossiers (read-only DB)
+- fix(worker): slot parity test uses pre-loop flux (accepted transits intact)
+- fix(worker): epoch-class robust errors, drift refinement, parity-directed slot dedup, sequential spec
+- fix(worker): epoch-class stats normalise t0 to transit centre; MIN_EPOCHS_PER_CLASS=2
+- feat(worker): epoch-class alias check in harmonic resolver (harmonic_epoch_class, default off)
+- fix(postprocess): harmonic dedup drops only when keeper is strong; sector-filter lookup; edge tests
+- feat(postprocess): drop P/k harmonic duplicates from strong/finalist selection (EXONIT_HARMONIC_DEDUP)
+
 ## sync 2026-10-12 (internal fbdd171)
 - feat(release): publish_results.sh (single orphan commit to exonit-results) + README; fix gh visibility command
 - fix(release): replace internal [[memory]] links and list skipped legacy scorecards in results INDEX

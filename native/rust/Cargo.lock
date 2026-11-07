@@ -259,6 +259,7 @@ dependencies = [
  "cc",
  "cudarc",
  "fs4",
+ "hmac-sha256",
  "libc",
  "ocl",
  "ort",

@@ -34,17 +34,13 @@ import numpy as np
 
 from .contract import EXOMINER_PP_INPUTS, verify_feature_dict
 
-from exonit.config import config as _config
-
-_PROJECT_ROOT = _config.project_root
-
 # Pinned model identifier written alongside every score.
 EXOMINER_PP_MODEL_VERSION = "exominerpp2.0_ffi_cv-super-mean-ensemble_zenodo-17707413"
 
 DEFAULT_ENSEMBLE_DIR = Path(
     os.environ.get(
         "EXONIT_EXOMINER_PP_MODELS",
-        os.path.join(_PROJECT_ROOT, "extern", "exominerpp_zenodo", "models_cv"),
+        os.path.expanduser("~/exonit-extern/exominerpp_zenodo/models_cv"),
     )
 )
 CV_FOLDS = 5
@@ -68,8 +64,7 @@ def _register_custom_layers() -> None:
     """
     import sys
 
-    repo = os.environ.get(
-        "EXONIT_EXOMINER_REPO", os.path.join(_PROJECT_ROOT, "extern", "ExoMiner"))
+    repo = os.environ.get("EXONIT_EXOMINER_REPO", os.path.expanduser("~/exonit-extern/ExoMiner"))
     if repo not in sys.path:
         sys.path.insert(0, repo)
     try:

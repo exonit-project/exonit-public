@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from exonit import __version__
 from exonit import stellar_gates
 from exonit.berger_catalog import BergerCatalog
-from exonit.config import ExoNitConfig
+from exonit.config import ExoNitConfig, harmonic_epoch_class_enabled
 from exonit.db import ExoNitDB, _tic_str
 from exonit.dist_semaphore import DistributedSemaphore
 from exonit.routes.deps import ServerDeps
@@ -51,12 +51,12 @@ logger = logging.getLogger("exonit.server")
 # Tasks stay assigned until the worker either reports a result or has been
 # silent for this many seconds. Anything shorter (e.g. the old 120s) causes
 # spurious reassignment during injection recovery (which alone can take 5-7
-# min on a long-baseline target). 2026-08-07 (operator decision): 1800 -> 900. The 1800
+# min on a long-baseline target). 2026-08-07 (the owner): 1800 -> 900. The 1800
 # guard protected Python workers whose heartbeat stalls under the GIL during
 # heavy BLS/injection; the primary fleet is now ~96% native (Rust/Swift,
 # heartbeat on its own thread, no GIL stalls) and 900s still leaves 2x margin
 # over the 5-7 min legit worst case of the remaining Python scanners
-# (laptop/M1). Worst downside is duplicate compute, never a wrong result.
+# (<host>/M1). Worst downside is duplicate compute, never a wrong result.
 STALE_TASK_TIMEOUT_SECONDS = 900  # 15 min
 ABSOLUTE_ABANDON_TIMEOUT_SECONDS = 3600  # hard ceiling: a task assigned longer
 # than this is reassigned regardless of worker liveness / current_tic — no
@@ -159,27 +159,59 @@ _WORKER_BACKFILL_TIC_KEY = "worker:backfill_tic"
 BACKFILL_HOLD_CEILING_SECONDS = int(
     os.environ.get("EXONIT_BACKFILL_HOLD_CEILING_S", "900"))
 
+#: FPP-only override of the ceiling above (FPP v3 with ephemeris refinement runs ~2.5x longer than the
+#: legacy model; ExoMiner keeps the shared value).  UNSET = the FPP stream uses BACKFILL_HOLD_CEILING_SECONDS,
+#: i.e. behaviour is unchanged until the owner sets it (docs/handoff/fpp-v3-deploy-prep.md, item 2).
+#: Raising it also needs EXONIT_FPP_VISIBILITY_S / EXONIT_FPP_MAX_DELIVERIES to be considered, see there.
+_fpp_ceiling_env = os.environ.get("EXONIT_FPP_HOLD_CEILING_S", "").strip()
+FPP_HOLD_CEILING_SECONDS = int(_fpp_ceiling_env) if _fpp_ceiling_env else None
 
-def _set_worker_backfill_tic(worker_id, tic_id, task_type):
+
+def fpp_hold_ceiling_s():
+    """The hold ceiling the FPP stream's ``keep_if`` applies (read at call time)."""
+    return BACKFILL_HOLD_CEILING_SECONDS if FPP_HOLD_CEILING_SECONDS is None else FPP_HOLD_CEILING_SECONDS
+
+
+def backfill_display_max_age_s():
+    """How old a hold may be and still be SHOWN on the dashboard: never shorter than the longest ceiling in force."""
+    return max(1800, BACKFILL_HOLD_CEILING_SECONDS, fpp_hold_ceiling_s())
+
+
+def _set_worker_backfill_tic(worker_id, tic_id, task_type, candidate_id=None):
     """Record that ``worker_id`` started a backfill TIC (called at assignment)."""
     if not worker_id:
         return
+    entry = {"tic_id": tic_id, "task_type": task_type, "ts": _time.time()}
+    if candidate_id is not None:
+        entry["candidate_id"] = int(candidate_id)
     get_shared_state().hset_json(
         _WORKER_BACKFILL_TIC_KEY,
         str(worker_id),
-        {"tic_id": tic_id, "task_type": task_type, "ts": _time.time()},
+        entry,
     )
 
 
-def _clear_worker_backfill_tic(worker_id):
+def _clear_worker_backfill_tic(worker_id, candidate_id=None):
     """Clear a worker's backfill TIC (called when its *_result arrives)."""
     if not worker_id:
         return
-    get_shared_state().hdel(_WORKER_BACKFILL_TIC_KEY, str(worker_id))
+    store = get_shared_state()
+    if candidate_id is not None:
+        entry = store.hget_json(_WORKER_BACKFILL_TIC_KEY, str(worker_id))
+        if not entry or entry.get("candidate_id") not in (None, int(candidate_id)):
+            return
+        store.hdel_json_if(_WORKER_BACKFILL_TIC_KEY, str(worker_id), entry)
+    else:
+        store.hdel(_WORKER_BACKFILL_TIC_KEY, str(worker_id))
 
 
-def _get_worker_backfill_tic(worker_id, max_age=1800):
-    """Return (tic_id, task_type) the worker is backfilling, or None if absent/stale."""
+def _get_worker_backfill_tic(worker_id, max_age=1800, reap=True):
+    """Return (tic_id, task_type) the worker is backfilling, or None if absent/stale.
+
+    ``reap=True`` (default, historical) also DELETES an entry older than *max_age*.  Every READER that is not
+    the owner of the hold (the dashboard listing, the ``keep_if`` veto) must pass ``reap=False``: a display or
+    a steal check must never destroy the evidence the hold-ceiling veto relies on (review B1, 2026-10-30: a
+    dashboard poll deleted every hold older than 1800 s, defeating EXONIT_FPP_HOLD_CEILING_S)."""
     if not worker_id:
         return None
     store = get_shared_state()
@@ -187,7 +219,8 @@ def _get_worker_backfill_tic(worker_id, max_age=1800):
     if not bf:
         return None
     if _time.time() - bf["ts"] > max_age:
-        store.hdel(_WORKER_BACKFILL_TIC_KEY, str(worker_id))
+        if reap:
+            store.hdel(_WORKER_BACKFILL_TIC_KEY, str(worker_id))
         return None
     return (bf["tic_id"], bf["task_type"])
 
@@ -214,7 +247,7 @@ def _backfill_hold_age(worker_id):
     return _time.time() - bf["ts"]
 
 
-def _worker_alive_and_on(workers_state, worker_id, tic_id) -> bool:
+def _worker_alive_and_on(workers_state, worker_id, tic_id, ceiling_s=None) -> bool:
     """True iff *worker_id* is alive (fresh heartbeat) AND its recorded
     ``worker:backfill_tic`` entry is *tic_id* — i.e. it is legitimately
     still processing this exact item right now, so a work-stream's
@@ -239,16 +272,22 @@ def _worker_alive_and_on(workers_state, worker_id, tic_id) -> bool:
     the failure modes and the run it cost). Past the ceiling we stop believing
     it and let the item be stolen — exactly what branch 1 of
     reassign_stale_tasks does to a primary task that has been assigned too long.
+
+    *ceiling_s* overrides the ceiling for one caller (the FPP stream passes ``fpp_hold_ceiling_s()``);
+    None = ``BACKFILL_HOLD_CEILING_SECONDS``.
     """
     w = workers_state.get(worker_id)
     if not w:
         return False
     if _time.time() - w.get("last_heartbeat", 0) >= WORKER_ALIVE_WINDOW_SECONDS:
         return False
+    ceiling = BACKFILL_HOLD_CEILING_SECONDS if ceiling_s is None else ceiling_s
     hold_age = _backfill_hold_age(worker_id)
-    if hold_age is None or hold_age > BACKFILL_HOLD_CEILING_SECONDS:
+    if hold_age is None or hold_age > ceiling:
         return False
-    bf = _get_worker_backfill_tic(worker_id)
+    # _get_worker_backfill_tic would reap (HDEL + None) entries older than its max_age (default 1800 s), which
+    # would silently cap any ceiling above 1800 s: read with max_age >= ceiling and never reap from a veto check.
+    bf = _get_worker_backfill_tic(worker_id, max_age=max(1800, ceiling), reap=False)
     if not bf:
         return False
     owner_tic, _task_type = bf
@@ -319,7 +358,9 @@ def _reap_stale_assignments(assignments_key: str, timeout_seconds: float) -> Non
             st.hdel(assignments_key, cid_str)
 
 
-def _claim_candidate(assignments_key: str, candidate_id, now: float = None) -> bool:
+def _claim_candidate(assignments_key: str, candidate_id, now: float = None,
+                     worker_id: str = None, claim_id: str = None,
+                     input_sig: str = None) -> bool:
     """Atomically claim *candidate_id* under *assignments_key* (HSETNX).
 
     One caller wins; every other concurrent poller — even in a different
@@ -330,8 +371,17 @@ def _claim_candidate(assignments_key: str, candidate_id, now: float = None) -> b
     """
     if now is None:
         now = _time.time()
+    entry = {"ts": now}
+    if worker_id:
+        entry["worker_id"] = str(worker_id)
+    if claim_id:
+        entry["claim_id"] = str(claim_id)
+    if input_sig:
+        # digest of the input the task was built from (population version / sha / R8 counts):
+        # the legacy FPP release counter is keyed by it (exonit.fpp_readiness.legacy_release_field)
+        entry["input_sig"] = str(input_sig)
     return get_shared_state().hsetnx_json(
-        assignments_key, str(candidate_id), {"ts": now})
+        assignments_key, str(candidate_id), entry)
 
 
 def _build_backfill_payload(candidate) -> dict:
@@ -418,7 +468,7 @@ _LORA_BASELINE_STARTED_AT_KEY = "lora_baseline:started_at"
 
 # Primary BLS task queue baseline. Snapshots `pending + assigned` on first
 # call after server start so the UI can show "X done of Y in this run".
-# The operator resets via POST /api/admin/reset_baselines when launching a new big run.
+# the owner resets via POST /api/admin/reset_baselines when launching a new big run.
 # A2a: same set_if_absent + get_int pattern as exominer/lora baselines.
 _PRIMARY_BASELINE_PENDING_KEY = "primary_baseline:pending"
 _PRIMARY_BASELINE_STARTED_AT_KEY = "primary_baseline:started_at"
@@ -1512,8 +1562,9 @@ def _run_fpp_gate_background(db, tic_id, mc, berger):
     Errors are caught and printed; the gate must NEVER break result posting.
     """
     try:
-        if target_mass_is_uncomputable(mc, berger, tic_id):
-            n = db.mark_fpp_uncomputable_for_tic(tic_id)
+        _reason = target_mass_unavailable_reason(mc, berger, tic_id)
+        if _reason is not None:
+            n = db.mark_fpp_uncomputable_for_tic(tic_id, reason=_reason)
             logger.info("FPP-gate TIC %s: uncomputable mass, pre-marked %d "
                         "candidate(s) fpp=-1", tic_id, n)
             # No mass → no FPP, whatever the depth says. The Rp-gate below would
@@ -1602,24 +1653,22 @@ def _run_companion_gate_background(db, tic_id, mc):
         logger.warning("Rp-gate failed TIC %s: %s", tic_id, e)
 
 
+from exonit import stellar_params as _stellar_params  # noqa: E402
+
+
 def derive_mass_from_logg_rad(logg, rad):
-    """Recover stellar mass (in Msun) from log g (dex, CGS) and R* (Rsun).
-
-    Uses g = GM/R² with logg_sun = 4.438 dex (CGS). Stop-gap before the
-    Berger+2023 catalog integration (#10) for TIC v8 targets whose mass
-    field is null but logg and rad are present — common for evolved /
-    subgiant stars. Returns None if either input is missing/invalid.
-    """
-    if logg is None or rad is None:
-        return None
-    try:
-        return float(rad) ** 2 * 10 ** (float(logg) - 4.438)
-    except (TypeError, ValueError):
-        return None
+    """Stellar mass (Msun) from logg + R*; thin alias of the shared, bounded
+    derivation in exonit.stellar_params (used by both /api/nearby paths and the
+    FPP gate). None if inputs are missing/placeholder/out of physical range."""
+    return _stellar_params.derive_mass_from_logg_rad(logg, rad)
 
 
-def target_mass_is_uncomputable(cache, berger_catalog, tic_id: str) -> bool:
-    """Return True when the target star has no usable stellar mass.
+def target_mass_unavailable_reason(cache, berger_catalog, tic_id: str):
+    """Return None when the target star has a usable stellar mass, else the
+    skip reason: 'giant_host' or 'stellar_params_missing' (exonit.stellar_params).
+    The bool view of this is target_mass_is_uncomputable.
+
+    Original contract (True == a reason is returned):
 
     Replicates EXACTLY the three-step enrichment that /api/nearby applies
     before serving params to the FPP worker, so server-side and worker-side
@@ -1645,7 +1694,7 @@ def target_mass_is_uncomputable(cache, berger_catalog, tic_id: str) -> bool:
     cached = cache.get_nearby_stars(tic_id)
     if not cached:
         # No nearby-stars entry at all — can't determine; let worker decide.
-        return False
+        return None
     stars, _gal_b = cached
 
     # Find the target itself (neighbor_id == tic_id).
@@ -1656,7 +1705,7 @@ def target_mass_is_uncomputable(cache, berger_catalog, tic_id: str) -> bool:
             break
     if target is None:
         # Target row absent in nearby_stars list — can't determine.
-        return False
+        return None
 
     # Helper: treat float NaN and None as "missing".
     def _missing(v):
@@ -1667,29 +1716,15 @@ def target_mass_is_uncomputable(cache, berger_catalog, tic_id: str) -> bool:
         except (TypeError, ValueError):
             return True
 
-    mass = target.get("mass")
-    rad  = target.get("rad")
-    teff = target.get("Teff")
-
-    # Step 2: Berger+2023 overlay — cheap dict lookup (catalog in memory).
-    if berger_catalog is not None:
-        try:
-            bg = berger_catalog.lookup_by_tic(int(tic_id))
-        except (ValueError, TypeError):
-            bg = None
-        if bg is not None:
-            mass = bg.get("mass")
-            rad  = bg.get("rad")
-            teff = bg.get("teff")
-
-    # Step 3: derive mass from logg + rad when mass is still missing.
-    # logg comes from the metadata cache's main table (not nearby_stars).
-    if _missing(mass) and not _missing(rad):
-        entry = cache.get_entry(tic_id)
-        logg = entry.get("logg") if entry else None
-        derived = derive_mass_from_logg_rad(logg, rad)
-        if derived is not None:
-            mass = derived
+    # Steps 2+3 through the SAME function /api/nearby uses on both its cache
+    # and live paths (exonit.stellar_params.enrich_nearby_stars): derive from
+    # the metadata-cache logg, then Berger+2023 overlay.
+    entry = cache.get_entry(tic_id)
+    logg = entry.get("logg") if entry else None
+    probe = dict(target)
+    _stellar_params.enrich_nearby_stars(
+        [probe], berger_catalog, {str(tic_id): logg})
+    mass, rad, teff = probe.get("mass"), probe.get("rad"), probe.get("Teff")
 
     # Uncomputable = ANY of mass / rad / Teff is missing/NaN.
     # Worker condition (fpp_native.py:~1182-1190):
@@ -1699,7 +1734,16 @@ def target_mass_is_uncomputable(cache, berger_catalog, tic_id: str) -> bool:
     # parameter causes the worker to skip with -1.  The gate mirrors this
     # OR condition exactly: if any one of the three is absent the FPP call
     # would produce -1 anyway, so we mark it uncomputable server-side.
-    return _missing(mass) or _missing(rad) or _missing(teff)
+    if _missing(mass):
+        return probe.get("mass_unavailable_reason") or _stellar_params.classify_no_mass(rad, logg)
+    if _missing(rad) or _missing(teff):
+        return "stellar_params_missing"
+    return None
+
+
+def target_mass_is_uncomputable(cache, berger_catalog, tic_id: str) -> bool:
+    """True when target_mass_unavailable_reason() gives a reason (unchanged bool contract)."""
+    return target_mass_unavailable_reason(cache, berger_catalog, tic_id) is not None
 
 
 _exominer_allowlist_cache: dict = {"mtime": 0.0, "names": None, "src": ""}
@@ -2183,6 +2227,7 @@ from exonit.routes import admin as admin_routes
 from exonit.routes import aws as aws_routes
 from exonit.routes import candidates as candidates_routes
 from exonit.routes import discovery as discovery_routes
+from exonit.routes import fpp_background as fpp_background_routes
 from exonit.routes import progress as progress_routes
 from exonit.routes import proxies as proxies_routes
 from exonit.routes import sky as sky_routes
@@ -2233,6 +2278,10 @@ def create_app(config=None) -> FastAPI:
 
     cfg = config if config else ExoNitConfig()
 
+    # Fail fast on a malformed EXONIT_HARMONIC_EPOCH_CLASS (strict 0/1), before
+    # any worker can poll a task.
+    harmonic_epoch_class_enabled()
+
     app = FastAPI(title="ExoNit", version=__version__)
     app.add_middleware(GZipMiddleware, minimum_size=10_000)
     db = ExoNitDB(db_path)
@@ -2242,6 +2291,16 @@ def create_app(config=None) -> FastAPI:
     # _purge_telemetry_once) so only one of the N uvicorn workers in A3
     # multi-process mode actually runs the DELETE.
     _purge_telemetry_once(db, get_shared_state(), 5)
+
+    # FPP population family (decision D2): a misconfigured EXONIT_FPP_POPULATION_FAMILY is logged
+    # ONCE here at ERROR instead of per TIC; never raised (unset = legacy path, the server must start)
+    # and every consumer keeps refusing (no population is ever picked).
+    from exonit.fpp_background import check_population_family_config
+    check_population_family_config()
+    # Materialized galaxia-rs store (EXONIT_FPP_GALAXIA_STORE_INDEX, default unset = fpp_background
+    # table): opened and verified once here; an unusable store is logged once, never raised.
+    from exonit.fpp_galaxia_store import check_store_config
+    check_store_config()
 
     # --- Worker state (shared, dict-compatible) ---
     # WorkerRegistry wraps the SharedStateBackend (Redis or in-memory) with the
@@ -2522,6 +2581,7 @@ def create_app(config=None) -> FastAPI:
     workers_routes.register(app, deps)
     candidates_routes.register(app, deps)
     proxies_routes.register(app, deps)
+    fpp_background_routes.register(app, deps)
     progress_routes.register(app, deps)
     discovery_routes.register(app, deps)
     aws_routes.register(app, deps)

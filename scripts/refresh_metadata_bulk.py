@@ -3,13 +3,13 @@
 validation and one-off backfill OUTSIDE the enqueue hot path.
 
 Implements §2.5 of docs/superpowers/specs/2026-09-26-metadata-refresh-and-
-bulk-enqueue-design.md. operator decision (§8, 2026-09-26): NO mass backfill —
+bulk-enqueue-design.md. the owner's decision (§8, 2026-09-26): NO mass backfill —
 the refresh is lazy, at enqueue time, gated by ``EXONIT_METADATA_REFRESH``.
 This CLI exists for:
 
   (i)  pre-deploy validation against a real lot's CSV or a sector's TIC list
        (``--dry-run``, the default — writes nothing);
-  (ii) an OPTIONAL, manually-triggered one-off refresh/backfill, if the operator ever
+  (ii) an OPTIONAL, manually-triggered one-off refresh/backfill, if the owner ever
        decides one is worth it later (``--apply``);
   (iii) the sample staleness report from spec §1.3 (``--report``, PostgreSQL
        metadata backend only).

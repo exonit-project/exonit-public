@@ -18,7 +18,7 @@ Only used when (see ``scripts/discovery_run.py``'s call site):
   - the caller did not pass ``--full-scan`` (the exact-recall safety net for
     a near-closed sector — see ``verify_sector_complete.py``/autofill).
 
-Accepted trade-off (§4.1.8, operator decision §8.3/§9.3): a TIC BEHIND the
+Accepted trade-off (§4.1.8, the owner's decision §8.3/§9.3): a TIC BEHIND the
 cursor that is neither done(t) nor exhausted(t,S) nor in the retry pool
 (e.g. a lost best-effort ``mark_tic_done`` write) is never reselected in
 paged mode — the legacy path would eventually re-see it (it always rescans

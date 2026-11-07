@@ -9,7 +9,7 @@ description = "Automated exoplanet transit detection pipeline using TESS data"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
-authors = [{name = "Marc Balcells Sanahuja", email = "mbalcells@gmail.com"}]
+authors = [{name = "the owner Balcells", email = "mbalcells@gmail.com"}]
 
 [project.scripts]
 exonit = "run_nightly:main"

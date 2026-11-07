@@ -280,6 +280,15 @@ impl WorkerApiClient {
         self.send_json("api/worker/fpp_result", payload, Some(worker_id))
     }
 
+    /// Release an unavailable FPP reservation without posting a score.
+    pub fn release_fpp_task(
+        &self,
+        payload: &serde_json::Map<String, serde_json::Value>,
+        worker_id: &str,
+    ) -> Result<StatusResponse, WorkerApiError> {
+        self.send_json("api/worker/fpp_release", payload, Some(worker_id))
+    }
+
     /// Mirrors `WorkerAPIClient.postExoMinerResult(_:workerID:)`.
     pub fn post_exominer_result(
         &self,
@@ -305,6 +314,82 @@ impl WorkerApiClient {
             Err(WorkerApiError::HttpStatus(404, _)) => Ok(None),
             Err(other) => Err(other),
         }
+    }
+
+    /// python `worker/server_ffi_client.py::fetch_ffi` (the `_try_ffi_fallback`
+    /// source): `GET /api/ffi/{tic}` with `Authorization: Bearer` ONLY (no
+    /// `X-Worker-ID`), the given timeout, NO retries; sectors concatenated and
+    /// sorted by time. `None` on ANY failure: transport error/timeout, 404 or
+    /// any status != 200, malformed payload, no sectors, time/flux length
+    /// mismatch. JSON `null` samples read as NaN (numpy `float`).
+    pub fn fetch_ffi_for_fallback(&self, tic_id: &str, timeout: Duration) -> Option<(Vec<f64>, Vec<f64>)> {
+        let request = self
+            .agent
+            .get(self.url(&format!("api/ffi/{tic_id}")))
+            .header("Authorization", format!("Bearer {}", self.token))
+            .config()
+            .timeout_global(Some(timeout))
+            .build();
+        let mut response = match map_transport(request.call()) {
+            Ok(response) => response,
+            Err(error) => {
+                eprintln!("ffi fetch failed for tic {tic_id}: {error}");
+                return None;
+            }
+        };
+        let status = response.status().as_u16();
+        if status != 200 {
+            if status != 404 {
+                eprintln!("ffi fetch HTTP {status} for tic {tic_id}");
+            }
+            return None;
+        }
+        let bytes = read_body_bytes(&mut response).ok()?;
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        let sectors = payload.get("sectors")?.as_array()?;
+        let column = |value: &serde_json::Value| -> Option<Vec<f64>> {
+            value
+                .as_array()?
+                .iter()
+                .map(|v| if v.is_null() { Some(f64::NAN) } else { v.as_f64() })
+                .collect()
+        };
+        let (mut time, mut flux) = (Vec::new(), Vec::new());
+        for sector in sectors {
+            let t = column(sector.get("time")?)?;
+            let f = column(sector.get("flux")?)?;
+            if t.len() != f.len() {
+                return None;
+            }
+            time.extend(t);
+            flux.extend(f);
+        }
+        if time.is_empty() && sectors.is_empty() {
+            return None;
+        }
+        let mut order: Vec<usize> = (0..time.len()).collect();
+        order.sort_by(|&a, &b| time[a].total_cmp(&time[b]));
+        Some((order.iter().map(|&i| time[i]).collect(), order.iter().map(|&i| flux[i]).collect()))
+    }
+
+    /// `fetch_metadata` with an explicit timeout (python fallback: 5 s, best effort).
+    pub fn fetch_metadata_with_timeout(
+        &self,
+        tic_id: &str,
+        worker_id: Option<&str>,
+        timeout: Duration,
+    ) -> Result<StarMetadata, WorkerApiError> {
+        let mut builder = self
+            .agent
+            .get(self.url(&format!("api/metadata/{tic_id}")))
+            .header("Authorization", format!("Bearer {}", self.token))
+            .header("Content-Type", "application/json");
+        if let Some(worker_id) = worker_id {
+            builder = builder.header("X-Worker-ID", worker_id);
+        }
+        let request = builder.config().timeout_global(Some(timeout)).build();
+        let response = map_transport(request.call())?;
+        self.finish_json(response)
     }
 
     /// Mirrors `WorkerAPIClient.fetchNearby(ticID:)`.

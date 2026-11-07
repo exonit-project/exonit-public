@@ -5,6 +5,11 @@ public enum FFIViewError: Error, Equatable, Sendable {
     case invalidEphemeris
     case sparseLightCurve
     case allBinsEmpty
+
+    /// The two "not enough data in the view window" errors: exactly what
+    /// Python's `cnn_ffi_views.ViewError` covers. The other two cases are
+    /// caller bugs and stay hard errors, as in Python.
+    public var isSparse: Bool { self == .sparseLightCurve || self == .allBinsEmpty }
 }
 
 public struct CNNFFIViews: Equatable, Sendable {
@@ -40,6 +45,27 @@ public enum FFIViewGenerator {
             width: duration * 0.16, minimum: -halfWindow, maximum: halfWindow
         ))
         return CNNFFIViews(global: global, local: local)
+    }
+
+    /// `makeCNNViews`, with a sparse view mapped to `nil` ("CNN not
+    /// available") instead of a thrown error. Python `worker/cnn_ffi.py`
+    /// returns None for the CNN score on `ViewError` (exonit
+    /// docs/reviews/2026-10-15-cnn-exact-zero-scores.md): the task continues
+    /// and the candidate gets no `cnn_score`. Unlike the Python worker (which
+    /// runs FPP in-task), this worker gets FPP only via backfill, whose SQL
+    /// requires `cnn_score >= 0.7 OR exominer_ffi_score >= 0.5`; a sparse
+    /// candidate (cnn nil, em_ffi 0.0) therefore gets NO FPP here. Open item,
+    /// folded into the FPP plan's server/DDL step.
+    public static func makeCNNViewsIfDense(
+        time: [Double], flux: [Double], period: Double, t0: Double, duration: Double
+    ) throws -> CNNFFIViews? {
+        do {
+            return try makeCNNViews(
+                time: time, flux: flux, period: period, t0: t0, duration: duration
+            )
+        } catch let error as FFIViewError where error.isSparse {
+            return nil
+        }
     }
 
     public static func makeAuxiliaryViews(

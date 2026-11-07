@@ -549,7 +549,7 @@ def _instances_out_of_phase(w: dict, phase: str):
     ``farmctl start --phase X`` means "size the fleet for phase X", and sizing
     down is half of sizing (2026-07-14). Before this, start was purely additive:
     a host declaring ``instances: 2`` / ``instances_fpp: 0`` (the slow hosts —
-    the M1 mac mini, the HP laptop, a laptop worker: they must scan but must NOT
+    the M1 mac mini, the HP laptop, a collaborator's MacBook: they must scan but must NOT
     take FPP work) kept both scan instances running straight through
     FPP_BACKFILL, because nothing ever told them to stop. Those are exactly the
     hosts whose FPP items become the tail everyone else waits on.
@@ -647,7 +647,7 @@ def cmd_start(args, manifest: dict) -> int:
         return _refuse_start()
     workers = select_workers(manifest, args.workers, args.all)
     server_url = manifest.get("server_url") or os.environ.get(
-        "EXONIT_FARMCTL_SERVER_URL", "http://127.0.0.1:8400")
+        "EXONIT_FARMCTL_SERVER_URL", "http://<server-ip>:8400")
     # --phase selects the sizing (instances vs instances_fpp) — see
     # _iter_instances. getattr default covers `restart`-via-`start` callers
     # that share an args namespace which may predate this flag.

@@ -1,5 +1,5 @@
 """Verdict Classifier v3_tfopwg — binary LightGBM trained on TFOPWG ground
-truth (KP/CP vs FP/FA), Phase 3 block 2 (Phase A).
+truth (KP/CP vs FP/FA), Fase 3 bloc 2 (Fase A).
 
 Unlike every prior verdict model in this repo (v1/v2/v2.1/v2.2), which train
 on ``claude_verdict`` (the local classifier's own past behaviour, see
@@ -25,7 +25,7 @@ mapped to the repo's canonical 3-class output via two thresholds (``t_lo``,
 ``t_hi``) stored IN the model payload, selected by nested cross-validation at
 training time (see ``scripts/train_verdict_classifier_v3_tfopwg.py`` — never
 tuned to hit the acceptance gate on the same data the gate is measured on,
-per spec §2 "Thresholds without circularity"):
+per spec §2 "Llindars sense circularitat"):
 
     p >= t_hi              -> planet_candidate
     p <  t_lo               -> likely_false_positive
@@ -37,7 +37,7 @@ per spec §2 "Thresholds without circularity"):
     uncertain : 1 - clamp(|p - 0.5| / ((t_hi - t_lo) / 2), 0, 1)  (1.0 exactly
         at p=0.5, the middle of the band, decaying to 0.0 at either edge)
 
-No ``apply_planet_rescue_gate`` (spec §5 "No apply_planet_rescue_gate" —
+No ``apply_planet_rescue_gate`` (spec §5 "Sense apply_planet_rescue_gate" —
 the rescue gate exists to counter v2.x's depth-domination; v3_tfopwg reports
 per-feature gain instead and, if ``depth_log1p`` exceeds 40% of gain, is
 retrained with the v2.2 ``feature_fraction`` mitigation — a training-time
@@ -54,8 +54,8 @@ REJECTED baseline, kept only for the old pickle; ``"none"`` — FPP/NFPP
 dropped entirely; ``"present_only"`` — FPP/NFPP kept as values, trained only
 on rows where FPP was present).
 
-For ``fpp_policy="present_only"`` specifically, spec §4's "**Forbidden**:
-derive any feature from the presence/absence of FPP beyond the flag"
+For ``fpp_policy="present_only"`` specifically, spec §4's "**Prohibit**
+derivar cap feature de la presència/absència de FPP més enllà del flag"
 requirement is enforced at SERVE time, not as a trained model behaviour: a
 candidate with no TRICERATOPS run has no input this variant's model was ever
 trained to interpret (every training row had FPP present, by construction),

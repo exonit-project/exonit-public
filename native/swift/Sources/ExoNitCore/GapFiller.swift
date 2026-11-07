@@ -16,22 +16,52 @@ public protocol GaussianNoiseSource {
     mutating func normal(mean: Double, standardDeviation: Double) -> Double
 }
 
-public struct SystemGaussianNoiseSource: GaussianNoiseSource {
-    private var spare: Double?
-    public init() {}
+/// numpy-legacy `RandomState(seed).normal(mean, sd)` noise source
+/// (fill-gaps-determinism, 2026-10-15). lightkurve's fill_gaps() draws from
+/// the unseeded global numpy RNG, which made repeat runs non-reproducible
+/// (IR pilot: 20/100 blank hosts changed candidate lists). Python now seeds a
+/// private RandomState from `GapFillSeed.seed(ticID:sectors:)`
+/// (worker/gap_fill.py); this source reproduces its unit-normal stream bit for
+/// bit. The amplitude differs: Python uses lightkurve's CDPP as sigma, this
+/// port the population std of the flux. There is no unseeded source any more.
+public struct SeededGaussianNoiseSource: GaussianNoiseSource {
+    private var rng: FPPRNG
+    public init(seed: UInt32) { rng = FPPRNG(seed: seed) }
 
     public mutating func normal(mean: Double, standardDeviation: Double) -> Double {
-        if let spare {
-            self.spare = nil
-            return mean + standardDeviation * spare
+        mean + standardDeviation * rng.gauss()
+    }
+}
+
+public enum GapFillSeed {
+    /// `"{tic}:{s1},{s2},..."` with sectors sorted and de-duplicated.
+    public static func key(ticID: String, sectors: [Int]) -> String {
+        "\(ticID):" + Set(sectors).sorted().map(String.init).joined(separator: ",")
+    }
+
+    /// FNV-1a 64 of the key, truncated to UInt32 (== worker/gap_fill.py).
+    public static func seed(ticID: String, sectors: [Int]) -> UInt32 {
+        fnv1a32(Array(key(ticID: ticID, sectors: sectors).utf8))
+    }
+
+    static func fnv1a32(_ bytes: [UInt8]) -> UInt32 {
+        var h: UInt64 = 0xcbf29ce484222325
+        for byte in bytes { h ^= UInt64(byte); h = h &* 0x00000100000001b3 }
+        return UInt32(truncatingIfNeeded: h)
+    }
+
+    /// Fallback for callers that know no TIC: FNV-1a over curve count and
+    /// each curve's length and first/last time bits (still deterministic).
+    public static func dataSeed(_ curves: [LightCurveData]) -> UInt32 {
+        var bytes: [UInt8] = []
+        func put(_ v: UInt64) { for i in 0..<8 { bytes.append(UInt8(truncatingIfNeeded: v >> (8 * UInt64(i)))) } }
+        put(UInt64(curves.count))
+        for c in curves {
+            put(UInt64(c.time.count))
+            put((c.time.first ?? 0).bitPattern)
+            put((c.time.last ?? 0).bitPattern)
         }
-        var u1 = Double.random(in: 0..<1)
-        while u1 == 0 { u1 = Double.random(in: 0..<1) }
-        let u2 = Double.random(in: 0..<1)
-        let radius = sqrt(-2 * log(u1))
-        let angle = 2 * Double.pi * u2
-        spare = radius * sin(angle)
-        return mean + standardDeviation * radius * cos(angle)
+        return fnv1a32(bytes)
     }
 }
 

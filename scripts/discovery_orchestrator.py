@@ -3,7 +3,7 @@
 
 Spawned as a background subprocess by the POST /api/discovery/scan endpoint
 once a lot has been successfully enqueued (status='started'). Runs on the
-server host.
+server host (<host>, <server-ip>).
 
 State machine (in order):
   IDLE → SCANNING → FPP_BACKFILL → EXOMINER_BACKFILL → POSTPROCESS → STOP_NVIDIARACK → LORA → FREE_GPU → FINALIZE → DONE
@@ -50,38 +50,28 @@ logger = logging.getLogger("discovery_orchestrator")
 # CONSTANTS — auditable, assertable in tests, easy to adjust if infra changes
 # ---------------------------------------------------------------------------
 
-#: The worker (name in ops/workers.json) that shares its GPU with the manual
-#: gpuq/vLLM LoRA fallback; stopped before LoRA so the GPU is fully available.
-#: Deployment-specific -> EXONIT_GPU_HOST_WORKER (empty: the step is a no-op).
-#: farmctl stop of a native worker's name also covers its python sidecars.
-NVIDIARACK_WORKER_NAME = os.environ.get("EXONIT_GPU_HOST_WORKER", "").strip()
+#: The worker stopped before LoRA so the RTX 5060 Ti is fully available.
+#: 2026-08-07: "worker-<host>" (Python) no longer exists — merged into
+#: worker-<host>-rust with sidecar_fpp (commit 8a42be3); farmctl stop of
+#: the -rust name covers both the native and the python sidecars of the host.
+NVIDIARACK_WORKER_NAME = "worker-<host>-rust"
 
 #: farmctl binary path (absolute, runs on <host>).
 FARMCTL_BIN = str(ROOT / "bin" / "farmctl")
 
-#: Manual-fallback GPU host (shared-GPU box with a `gpuq` job queue). All of
-#: this is deployment config (see .env.example): ssh target, the gpuq binary,
-#: the NVML-compat wrapper and the remote lora_via_gpuq.sh script. HARD RULE
-#: of the deployment this was written for: ALL GPU work on that box goes
-#: through gpuq (+ the wrapper) — never start vLLM/CUDA directly.
-GPUQ_SSH_TARGET = os.environ.get("EXONIT_GPUQ_SSH_TARGET", "user@gpu-host")
-GPUQ_BIN = os.environ.get("EXONIT_GPUQ_BIN", "gpuq")
-GPUQ_NVML_WRAPPER = os.environ.get("EXONIT_GPUQ_NVML_WRAPPER", "").strip()
-GPUQ_LORA_SCRIPT = os.environ.get("EXONIT_GPUQ_LORA_SCRIPT", "lora_via_gpuq.sh")
-
 #: Canonical SSH+gpuq command that starts vLLM in a gpuq slot, runs the
-#: generate_missing_explanations.py generator, then tears vLLM down
-#: (discovery-campaign.md step 12). Layout is asserted by
-#: tests/test_discovery_orchestrator.py::test_lora_ssh_cmd_canonical.
-_GPUQ_WRAP = f"{GPUQ_NVML_WRAPPER} " if GPUQ_NVML_WRAPPER else ""
+#: generate_missing_explanations.py generator on <host>, then tears
+#: vLLM down.  HARD RULE: ALL GPU work on <host> goes through gpuq +
+#: with_nvidia_nvml_compat.sh — never start vLLM/CUDA directly.
+#: (discovery-campaign.md step 12 + reference_gpuq_queue_nvidiarack).
 LORA_SSH_CMD = (
-    f"ssh -o BatchMode=yes -o ConnectTimeout=8 {GPUQ_SSH_TARGET} "
-    f'"bash -lc \'{_GPUQ_WRAP}'
-    f"{GPUQ_BIN} run --name exonit-lora "
-    f"--idle-mib 1000 --max-wait 0 bash {GPUQ_LORA_SCRIPT}'\""
+    "ssh -o BatchMode=yes -o ConnectTimeout=8 <user>@<postgres-host> "
+    '"bash -lc \'~/claude-memory-llm/with_nvidia_nvml_compat.sh '
+    "~/bin/gpuq run --name exonit-lora "
+    "--idle-mib 1000 --max-wait 0 bash ~/lora_via_gpuq.sh'\""
 )
 
-#: Phase 3 (2026-09-26): the LoRA step's DEFAULT is now the 5 Mac mini M4
+#: Fase 3 (2026-09-26): the LoRA step's DEFAULT is now the 5 Mac mini M4
 #: fleet (scripts/lora_macs_driver.py, mlx_lm.server + the same
 #: /api/explain shim) — <host>/vLLM is no longer on the critical path
 #: for every discovery lot (docs/superpowers/specs/2026-09-26-lora-macs-design.md).
@@ -95,25 +85,23 @@ LORA_SSH_CMD = (
 #: Both EXONIT_LORA_CMD and the override file accept a short ALIAS instead
 #: of a full command string, so a manual fallback never requires retyping
 #: the ssh+gpuq incantation by hand:
-#:   gpuq       -> LORA_SSH_CMD      (manual fallback: ssh+gpuq+vLLM;
-#:                                    legacy alias name: see LORA_CMD_ALIASES)
-#:   llamacpp   -> local llama.cpp on <host>'s Arc iGPU (Phase 2, superseded)
+#:   <host> -> LORA_SSH_CMD      (manual fallback: ssh+gpuq+vLLM)
+#:   llamacpp   -> local llama.cpp on <host>'s Arc iGPU (Fase 2, superseded)
 #:   macs       -> LORA_MACS_CMD     (== the default, spelled out explicitly)
-#: Anything else is used verbatim as the command (Phase 2 behaviour unchanged).
+#: Anything else is used verbatim as the command (Fase 2 behaviour unchanged).
 LORA_CMD_OVERRIDE_FILE = str(ROOT / "data" / "lora_cmd.override")
 
-#: Phase 3 default: scripts/lora_macs_driver.py, run with the same
+#: Fase 3 default: scripts/lora_macs_driver.py, run with the same
 #: `.venv-server` interpreter as the orchestrator itself (<host>).
 LORA_MACS_CMD = f"{sys.executable} {ROOT / 'scripts' / 'lora_macs_driver.py'}"
 
-#: Phase 2 override target, kept as a named alias (`llamacpp`) — local
+#: Fase 2 override target, kept as a named alias (`llamacpp`) — local
 #: llama.cpp on the Arc iGPU, superseded by the Macs but still wired up.
 LORA_LLAMACPP_CMD = f"bash {ROOT / 'ops' / 'lora_via_llamacpp.sh'}"
 
 #: Alias table for EXONIT_LORA_CMD / data/lora_cmd.override (see doc above).
 LORA_CMD_ALIASES = {
-    "gpuq": LORA_SSH_CMD,
-    "<host>": LORA_SSH_CMD,  # farm-literal-ok: legacy alias name still used by data/lora_cmd.override
+    "<host>": LORA_SSH_CMD,
     "llamacpp": LORA_LLAMACPP_CMD,
     "macs": LORA_MACS_CMD,
 }
@@ -154,10 +142,10 @@ def _is_nvidiarack_cmd(cmd: str) -> bool:
     `bash .../lora_via_gpuq.sh'` becomes `lora_via_gpuq.sh 5 50000'` once a
     sector/backlog is appended), which an exact-equality check would not.
     """
-    return os.path.basename(GPUQ_LORA_SCRIPT) in cmd
+    return "lora_via_gpuq.sh" in cmd
 
 
-#: 2026-09-20 (operator): on top of the run's own sector, each LORA step also
+#: 2026-09-20 (the owner): on top of the run's own sector, each LORA step also
 #: explains up to this many candidates of the historic backlog (every other
 #: sector, strong-tier gate first — generator ``--order strong --limit N``),
 #: so the ~214k rows left unexplained by the v3_tfopwg promotion drain over
@@ -191,12 +179,12 @@ def _lora_cmd_for_sector(sector: int | None,
     """
     if sector is None or not _is_nvidiarack_cmd(LORA_CMD):
         return LORA_CMD
-    marker = f"{GPUQ_LORA_SCRIPT}'"
+    marker = "lora_via_gpuq.sh'"
     assert marker in LORA_CMD, "LORA_SSH_CMD layout changed; update _lora_cmd_for_sector"
     args = f" {int(sector)}"
     if int(backlog_limit) > 0:
         args += f" {int(backlog_limit)}"
-    return LORA_CMD.replace(marker, f"{GPUQ_LORA_SCRIPT}{args}'", 1)
+    return LORA_CMD.replace(marker, f"lora_via_gpuq.sh{args}'", 1)
 
 #: Default state file location (relative to ROOT, overridable).
 DEFAULT_STATE_FILE = str(ROOT / "data" / "discovery" / "pipeline_state.json")
@@ -260,7 +248,7 @@ SCANNING_STUCK_POLLS = 120
 STALL_HEAL_POLLS = 10
 POLL_CONNECT_ERROR_LIMIT = 20
 
-#: Phase 3 Task 2 (durable orchestration): db.update_discovery_run(heartbeat=True)
+#: Fase 3 Task 2 (durable orchestration): db.update_discovery_run(heartbeat=True)
 #: from _poll_until_drained's loop is throttled to at most once per this many
 #: seconds, regardless of --poll-interval, so a tight interval never hammers PG.
 HEARTBEAT_MIN_INTERVAL_SECONDS = 30
@@ -278,7 +266,7 @@ HEARTBEAT_MIN_INTERVAL_SECONDS = 30
 #: separately at this ceiling (6h default).
 POSTPROCESS_TIMEOUT_SECONDS = float(
     os.environ.get("EXONIT_POSTPROCESS_TIMEOUT_SECONDS", str(6 * 3600)))
-#: FINALIZE completeness compaction (Phase 4a Task 4): scripts/
+#: FINALIZE completeness compaction (Fase 4a Task 4): scripts/
 #: compact_completeness.py drains completeness_staging into bucketed Parquet
 #: (MinIO) + PG aggregates. A full 256-bucket pass over real-scale buckets
 #: (~720k rows each) benchmarks at ~16-20 min on <host>, so 60 min gives
@@ -288,9 +276,9 @@ POSTPROCESS_TIMEOUT_SECONDS = float(
 #: pass to absorb.
 COMPLETENESS_COMPACTION_TIMEOUT_SECONDS = float(
     os.environ.get("EXONIT_COMPLETENESS_COMPACTION_TIMEOUT_SECONDS", "3600"))
-#: FINALIZE completeness compaction, REMOTE fast-path (2026-07-17, "fast completeness
-#: compaction" spec): both PG and MinIO for completeness live on
-#: the storage host (PG + MinIO) — running the compactor there over loopback
+#: FINALIZE completeness compaction, REMOTE fast-path (2026-07-17, "compact
+#: completeness ràpid" spec): both PG and MinIO for completeness live on
+#: <host> (<postgres-host>) — running the compactor there over loopback
 #: instead of from <host> over LAN removes the network round-trip that
 #: dominates a big pass. Tighter than the local 3600s default because a
 #: wedged/unreachable remote must fall back to local quickly rather than
@@ -328,7 +316,7 @@ EXONIT_COMPACT_SERVICE_HTTP_TIMEOUT_SECONDS = 30.0
 LORA_TIMEOUT_SECONDS = float(
     os.environ.get("EXONIT_LORA_TIMEOUT_SECONDS", str(24 * 3600)))
 
-#: Phase 3 Task 5: best-effort remote cancel of the 'exonit-lora' gpuq job when
+#: Fase 3 Task 5: best-effort remote cancel of the 'exonit-lora' gpuq job when
 #: step_lora's local TimeoutExpired backstop above fires. shell=True means the
 #: local kill only reaches the ssh shell (see KNOWN LIMITATION in step_lora),
 #: leaving the remote gpuq job running and wedging the <host> GPU queue
@@ -345,12 +333,12 @@ LORA_TIMEOUT_SECONDS = float(
 #:   so the id must be discovered by parsing `gpuq status` for a line with
 #:   name=exonit-lora and status in {running, queued}.
 LORA_CANCEL_STATUS_SSH_CMD = (
-    f"ssh -o BatchMode=yes -o ConnectTimeout=8 {GPUQ_SSH_TARGET} "
-    f'"{GPUQ_BIN} status --limit 50"'
+    "ssh -o BatchMode=yes -o ConnectTimeout=8 <user>@<postgres-host> "
+    '"~/bin/gpuq status --limit 50"'
 )
 LORA_CANCEL_SSH_CMD_TEMPLATE = (
-    f"ssh -o BatchMode=yes -o ConnectTimeout=8 {GPUQ_SSH_TARGET} "
-    f'"{GPUQ_BIN} cancel {{job_id}} --kill"'
+    "ssh -o BatchMode=yes -o ConnectTimeout=8 <user>@<postgres-host> "
+    '"~/bin/gpuq cancel {job_id} --kill"'
 )
 LORA_CANCEL_TIMEOUT_SECONDS = 60.0
 LORA_CANCEL_JOB_NAME = "exonit-lora"
@@ -375,7 +363,7 @@ AWS_SYNC_TIMEOUT_SECONDS = float(
 FLEET_AUTOSCALE_TIMEOUT_SECONDS = float(
     os.environ.get("EXONIT_FLEET_AUTOSCALE_TIMEOUT_SECONDS", "300"))
 
-#: Phase 3 Task 3 (dispatch table + --resume + checkpoint-skip): default FAILED
+#: Fase 3 Task 3 (dispatch table + --resume + checkpoint-skip): default FAILED
 #: detail text when a step returns a falsy detail string. Preserves the exact
 #: pre-Task-3 wording for the two states that had an `or "..."` fallback
 #: (SCANNING, FPP_BACKFILL) — every other state passes its detail through
@@ -407,9 +395,9 @@ def _save_state(path: str, state: dict) -> None:
     tmp.replace(p)
 
 
-#: Phase 3 Task 2 — module-level orchestrator DB state. The orchestrator runs
+#: Fase 3 Task 2 — module-level orchestrator DB state. The orchestrator runs
 #: as a standalone script (no ServerDeps/app context), and _persist_state's
-#: signature is fixed by the Phase-3 plan (sf, run_id, state, extra, heartbeat
+#: signature is fixed by the Fase-3 plan (sf, run_id, state, extra, heartbeat
 #: — no db-handle parameter), so run() stashes the resolved db path / dry-run
 #: gate here once, at the top, exactly like the existing DEFAULT_STATE_FILE-
 #: style module constants above. Defaults are the SAFE no-op state (no path,
@@ -486,7 +474,7 @@ def _ensure_run_scope(run_id: str, lot_csv: str) -> None:
     ``EXONIT_RUN_TICS_WRITE`` (default 1, so a deployment that hasn't yet
     flipped to ``EXONIT_RUN_SCOPE=tasks`` keeps writing it exactly as
     before). Set to 0 only once >=2 lots have run clean under
-    ``EXONIT_RUN_SCOPE=tasks`` (operator decision §9.2 / the spec's §3.5
+    ``EXONIT_RUN_SCOPE=tasks`` (the owner's decision §9.2 / the spec's §3.5
     deploy windows W4-W5) — this table is NOT dropped by S3 itself. Logs
     ``db.run_scope_kind(run_id)`` either way so a run's log makes the active
     scope mechanism observable without a separate query.
@@ -654,7 +642,7 @@ def _health_work_url(server_url: str, run_id: str | None) -> str:
 
 
 def _write_checkpoint(run_id: str | None, step: str, data: dict) -> None:
-    """Best-effort ``discovery_runs.checkpoints[step]`` write (Phase 3 Task 3).
+    """Best-effort ``discovery_runs.checkpoints[step]`` write (Fase 3 Task 3).
 
     Mirrors _ensure_discovery_run_row's non-fatal contract: PG being down (or
     the --dry-run gate closing _get_orchestrator_db()) must never fail an
@@ -686,7 +674,7 @@ def _write_checkpoint(run_id: str | None, step: str, data: dict) -> None:
 
 def _persist_state(sf: str, run_id: str | None, *, state: str | None = None,
                     extra: dict | None = None, heartbeat: bool = False) -> None:
-    """Single choke point for ALL orchestrator state writes (Phase 3 Task 2).
+    """Single choke point for ALL orchestrator state writes (Fase 3 Task 2).
 
     (1) Writes the JSON mirror file — unchanged atomic write+rename format,
         still the fallback/source of truth for every existing reader (UI,
@@ -805,7 +793,7 @@ def _set_state(path: str, state_name: str, *, fresh: bool = False,
     previous FAILED run is cleared so the UI never shows a stale error.
     For FAILED, the caller provides detail via **extra.
 
-    Phase 3 Task 2: also best-effort dual-writes the same state to PG (see
+    Fase 3 Task 2: also best-effort dual-writes the same state to PG (see
     _persist_state). ``run_id`` need only be passed explicitly on the FIRST
     call of a run (run()'s initial fresh=True SCANNING transition) — once
     written, it persists in the JSON file, so every subsequent call
@@ -845,7 +833,7 @@ def _merge_state(path: str, *, run_id: str | None = None, **extra) -> None:
     Used to persist ancillary data (e.g. scorecard paths) mid-step without
     emitting a spurious state transition that would confuse the UI or tests.
 
-    Phase 3 Task 2: also dual-writes to PG with state=None (leaves the PG row's
+    Fase 3 Task 2: also dual-writes to PG with state=None (leaves the PG row's
     state column untouched — the exact same "don't change state" semantics
     as the JSON side).
     """
@@ -933,7 +921,7 @@ def _poll_until_drained(
         msg) has been logged as an error. Returning None keeps the default
         (False, msg); returning a tuple overrides it (EXOMINER_BACKFILL's
         AWS special-case: stuck is expected there, so it returns (True, ...)).
-    state_file, run_id : Phase 3 Task 2 — when run_id is given, each loop
+    state_file, run_id : Fase 3 Task 2 — when run_id is given, each loop
         iteration best-effort heartbeats via
         db.update_discovery_run(run_id, heartbeat=True), throttled to at most
         once per HEARTBEAT_MIN_INTERVAL_SECONDS regardless of poll_interval.
@@ -1248,7 +1236,7 @@ def step_scanning(server_url: str, state_file: str, poll_interval: int, dry_run:
             f"workers, then re-run the orchestrator."
         )
 
-    # Phase 3 Task 2: run_id (if the state file already carries one) enables
+    # Fase 3 Task 2: run_id (if the state file already carries one) enables
     # the heartbeat inside _poll_until_drained — and, since 2026-07-14, scopes
     # the counters to this lot (read once above, for the URL).
     return _poll_until_drained(
@@ -1265,20 +1253,51 @@ def step_scanning(server_url: str, state_file: str, poll_interval: int, dry_run:
     )
 
 
+def _fpp_readiness_gate(server_url: str, run_id: str | None = None) -> tuple[bool, str]:
+    """Require complete population / R8 data for THIS run's FPP candidates before FPP starts.
+
+    ``run_id`` scopes the server-side check to the run's TIC set (the whole backlog otherwise,
+    which would hold every run back for fields of other lots). Fields parked as
+    ``population_alarm_unresolved`` never block; they are logged so they stay visible.
+    """
+    from exonit.config import worker_token
+    url = server_url.rstrip("/") + "/api/worker/fpp_readiness"
+    if run_id:
+        url += f"?run_id={quote(str(run_id))}"
+    req = urllib.request.Request(url)
+    req.add_header("Authorization", f"Bearer {worker_token()}")
+    try:
+        with urllib.request.urlopen(req, timeout=300) as response:
+            data = json.loads(response.read())
+        if data.get("parked"):
+            logger.warning("FPP readiness: parked (not blocking) %s; scope=%s",
+                           data["parked"], data.get("scope"))
+        if data.get("ready") is True:
+            return True, ""
+        return False, f"FPP population/R8 gate failed: {data.get('reasons', {})}"
+    except Exception as exc:
+        return False, f"FPP population/R8 gate unavailable: {exc}"
+
+
 def step_fpp_backfill(server_url: str, state_file: str, poll_interval: int, dry_run: bool) -> tuple[bool, str]:
     """Poll /api/health/work until FPP backfill is drained (actionable == 0).
 
     NOTE: We do NOT wait for ExoMiner backfill. ExoMiner Docker runs on the
     server for SPOC candidates; FFI-only TGLC candidates will never produce
     a Docker ExoMiner score. Waiting would block indefinitely.
-    (discovery-campaign.md step 12: 'trigger = primary + FPP backfill at 0;
-    ExoMiner Docker is left to run in the background.')
+    (discovery-campaign.md step 12: 'trigger = primary + FPP backfill a 0;
+    ExoMiner Docker se deixa córrer en segon pla.')
 
     Same safety nets as step_scanning: returns (False, detail) rather than
     looping forever if FPP backfill makes no net progress for
     SCANNING_STUCK_POLLS polls, or the server is unreachable for
     POLL_CONNECT_ERROR_LIMIT consecutive polls.
     """
+    if not dry_run:
+        ready, detail = _fpp_readiness_gate(server_url, _load_state(state_file).get("run_id"))
+        if not ready:
+            return False, detail
+
     # Fleet-autoscale-by-phase: scale the fleet UP to the FPP sizing on entry
     # (TRICERATOPS is far lighter per-instance than BLS+injection — ~2x
     # instances measured 07-11/07-12, see the spec). Non-fatal; a failure is
@@ -1302,7 +1321,13 @@ def step_fpp_backfill(server_url: str, state_file: str, poll_interval: int, dry_
     def _metric(data):
         fpp = data.get("fpp_backfill", {})
         actionable = fpp.get("actionable", 0)
-        return actionable, f"actionable={actionable}", {"actionable": actionable}
+        # Parked fields (unresolved R8 alarm; the server refuses them for good) are not
+        # actionable and are not waited on; surfaced here so the operator sees them.
+        parked = fpp.get("parked", 0)
+        suffix = f"actionable={actionable}"
+        if parked:
+            suffix += f" (parked={parked}, not waited on)"
+        return actionable, suffix, {"actionable": actionable, "parked": parked}
 
     def _stuck(extra, minutes):
         return (
@@ -1567,7 +1592,7 @@ def step_postprocess(
     depth_ppm, duration_hours, role) which discovery lot CSVs do not have
     (they only carry tic_id,label).  Calling it would raise KeyError: 'disposition'.
 
-    Phase 3 Task 2: run_id should be the ONE minted once at launch (run()'s
+    Fase 3 Task 2: run_id should be the ONE minted once at launch (run()'s
     args.run_id) — NOT re-derived here. Re-deriving via _derive_run_id at
     this point (hours into a run) was exactly the midnight-crossing bug this
     task fixes: POSTPROCESS/scorecard paths used to get a DIFFERENT date than
@@ -1641,6 +1666,7 @@ def step_postprocess(
     # discovered after the fact. Now scanned on EVERY subprocess result
     # (success or failure) and logged immediately.
     fpp_timeout_warnings: list[str] = []
+    veto_shadow_warnings: list[str] = []
 
     # Both POSTPROCESS children report into the SAME phase record; the substep
     # field ("postprocess" then "scorecard") is what says which one is running.
@@ -1663,6 +1689,12 @@ def step_postprocess(
             for line in step_warnings:
                 logger.warning("POSTPROCESS [%s]: %s", step_name, line)
             fpp_timeout_warnings.extend(step_warnings)
+            # EXONIT_VETO_V2=shadow failures: visible, never fatal (same channel idea as fpp-timeout)
+            shadow_w = [line for line in (result.stdout or "").splitlines()
+                        if line.startswith("WARNING veto-v2-shadow:")]
+            for line in shadow_w:
+                logger.warning("POSTPROCESS [%s]: %s", step_name, line)
+            veto_shadow_warnings.extend(shadow_w)
 
             if result.returncode != 0:
                 detail = (result.stderr or result.stdout or "")[:500]
@@ -1690,29 +1722,21 @@ def step_postprocess(
         scorecard_json=str(Path(scorecard_json).relative_to(ROOT)),
         dossier=str(Path(dossier_out).relative_to(ROOT)),
     )
+    if veto_shadow_warnings:
+        merge_fields["veto_v2_shadow_warning"] = "; ".join(veto_shadow_warnings)
     if fpp_timeout_warnings:
         # Also surface into the state file (not just the log stream) so the
         # UI can show it without a human having to open the dossier.
         merge_fields["fpp_timeout_warning"] = "; ".join(fpp_timeout_warnings)
     _merge_state(state_file, **merge_fields)
-    if fpp_timeout_warnings:
-        return True, "; ".join(fpp_timeout_warnings)
+    _w = fpp_timeout_warnings + veto_shadow_warnings
+    if _w:
+        return True, "; ".join(_w)
     return True, ""
 
 
 def step_stop_nvidiarack(state_file: str, dry_run: bool) -> tuple[bool, str]:
     """Stop worker-<host> via farmctl to free the GPU for LoRA."""
-    if not NVIDIARACK_WORKER_NAME:
-        if _is_nvidiarack_cmd(LORA_CMD) and not dry_run:
-            # The gpuq/vLLM LoRA path shares the GPU with that worker: running
-            # it without stopping the worker is the contention the step exists
-            # to prevent. Misconfiguration must fail loudly, not no-op.
-            msg = ("EXONIT_GPU_HOST_WORKER is not set but the LoRA command is the "
-                   "gpuq/GPU-host path — cannot stop the GPU-host worker")
-            logger.error("STOP_NVIDIARACK: %s", msg)
-            return False, msg
-        logger.warning("STOP_NVIDIARACK: EXONIT_GPU_HOST_WORKER not set — nothing to stop")
-        return True, ""
     cmd = [FARMCTL_BIN, "stop", NVIDIARACK_WORKER_NAME]
     logger.info("STOP_NVIDIARACK: %s", " ".join(cmd))
 
@@ -1735,7 +1759,7 @@ def step_stop_nvidiarack(state_file: str, dry_run: bool) -> tuple[bool, str]:
 
 def _cancel_remote_lora_job() -> None:
     """Best-effort: cancel the stuck 'exonit-lora' gpuq job on <host>
-    after step_lora's local TimeoutExpired backstop fires (Phase 3 Task 5).
+    after step_lora's local TimeoutExpired backstop fires (Fase 3 Task 5).
 
     HARD RULE: all <host> GPU work goes through gpuq; a job left running
     after our local kill (which per the KNOWN LIMITATION above only reaches
@@ -1819,7 +1843,7 @@ def _cancel_remote_lora_job() -> None:
             )
             return
         logger.warning(
-            "LORA cancel: gpuq job #%d (%s) cancelled on the GPU host after "
+            "LORA cancel: gpuq job #%d (%s) cancelled on <host> after "
             "the local timeout.", job_id, LORA_CANCEL_JOB_NAME,
         )
     except Exception as exc:
@@ -1833,7 +1857,7 @@ def step_lora(state_file: str, dry_run: bool,
     """Run the LoRA explanation job, scoped to *sector* (see _lora_cmd_for_sector)
     plus up to *backlog_limit* historic rows (default: LORA_BACKLOG_LIMIT).
 
-    Default (Phase 3, 2026-09-26): scripts/lora_macs_driver.py — the 5 Mac
+    Default (Fase 3, 2026-09-26): scripts/lora_macs_driver.py — the 5 Mac
     mini M4 fleet. Manual fallback (`<host>` alias / LORA_SSH_CMD): via
     gpuq on <host> — HARD RULE: ALL GPU work on <host> goes through
     with_nvidia_nvml_compat.sh + gpuq. Any other override (`llamacpp` alias,
@@ -1851,7 +1875,7 @@ def step_lora(state_file: str, dry_run: bool,
         env["EXONIT_LORA_SECTOR"] = str(int(sector))
         env["EXONIT_LORA_BACKLOG_LIMIT"] = str(backlog_limit)
     logger.info("LORA: running (blocking, %s, sector=%s, backlog_limit=%d): %s",
-                "gpuq" if is_nvidiarack else "override",
+                "gpuq/<host>" if is_nvidiarack else "override",
                 sector, backlog_limit, cmd)
 
     if dry_run:
@@ -1874,7 +1898,7 @@ def step_lora(state_file: str, dry_run: bool,
             # consumer). Minimum mitigation: the FAILED detail below tells the
             # operator to check/clear it manually (`gpuq status` /
             # `gpuq stop --name exonit-lora` on <host>). This path is now
-            # the MANUAL FALLBACK only (Phase 3 default moved to the Macs
+            # the MANUAL FALLBACK only (Fase 3 default moved to the Macs
             # driver below, which does not have this limitation) — a real fix
             # here would need a remote-side watchdog/timeout in
             # lora_via_gpuq.sh itself, still out of scope.
@@ -1901,12 +1925,12 @@ def step_lora(state_file: str, dry_run: bool,
                   f"({LORA_TIMEOUT_SECONDS / 3600:.1f}h) — killed locally. "
                   f"Backstop, not expected to fire on a healthy vLLM run. "
                   f"KNOWN LIMITATION: only the local ssh shell was killed — the "
-                  f"remote gpuq job ('exonit-lora') and vLLM under it "
+                  f"remote <host> gpuq job ('exonit-lora') and vLLM under it "
                   f"may still be running. Check/clear manually: "
-                  f"`gpuq status` and `gpuq stop --name exonit-lora` on the GPU host "
-                  f"({GPUQ_SSH_TARGET}) before starting any other GPU work there.")
+                  f"`gpuq status` and `gpuq stop --name exonit-lora` on <host> "
+                  f"(<postgres-host>) before starting any other GPU work there.")
             logger.error("LORA TIMEOUT: %s", msg)
-            # Phase 3 Task 5: best-effort — attempt the remote gpuq cancel so the
+            # Fase 3 Task 5: best-effort — attempt the remote gpuq cancel so the
             # GPU queue isn't left wedged. Never changes this step's outcome (see
             # _cancel_remote_lora_job's docstring): the returned (ok, msg) below
             # is identical whether the cancel succeeds, fails, or can't run at all.
@@ -1916,7 +1940,7 @@ def step_lora(state_file: str, dry_run: bool,
             logger.exception("LORA exception")
             return False, f"lora exception: {exc}"
 
-    # Non-<host> path (Phase 3 default: the Macs driver; also the Phase 2
+    # Non-<host> path (Fase 3 default: the Macs driver; also the Fase 2
     # llama.cpp override, or any ad-hoc command): everything the command
     # spawns is LOCAL to this host (ssh fan-out to the Macs happens INSIDE
     # lora_macs_driver.py, not here), so `start_new_session=True` +
@@ -1944,7 +1968,7 @@ def step_lora(state_file: str, dry_run: bool,
               f"teardown (lora_macs_driver.py's `finally` + signal handlers, "
               f"or ops/lora_via_llamacpp.sh's EXIT trap) should still run; "
               f"verify no mlx_lm.server/explainer shim/llama-server processes "
-              f"are left on the Mac fleet or the server host before starting any other "
+              f"are left on the Mac fleet or <host> before starting any other "
               f"LoRA job.")
         logger.error("LORA TIMEOUT: %s", msg)
         try:
@@ -1975,7 +1999,7 @@ def _compact_remote_dsn(pg_dsn: str) -> str:
     PostgreSQL — ``127.0.0.1``, never the LAN IP.
 
     Verified operationally (2026-07-17): <host>'s ``pg_hba.conf`` does
-    not accept connections from its OWN LAN address even
+    not accept connections from its OWN LAN address (<postgres-host>) even
     though that address is exactly what ``db_path`` correctly holds from
     <host>'s (the orchestrator's) point of view. ``EXONIT_COMPACT_REMOTE_DSN``
     overrides this entirely (e.g. a non-standard port or socket path) when
@@ -2022,13 +2046,11 @@ def _compact_remote_cmd(host: str, pg_dsn: str, run_id: str | None = None) -> li
             f"EXONIT_PROGRESS_RUN_ID={shlex.quote(run_id)} "
             f"EXONIT_PROGRESS_PHASE=FINALIZE "
             f"EXONIT_PROGRESS_URL={shlex.quote(progress_url)} ")
-    # Checkout on the REMOTE host; "$HOME" is expanded by its login shell.
-    remote_repo = os.environ.get("EXONIT_COMPACT_REMOTE_REPO", "$HOME/exonit")
     remote_shell_cmd = (
-        f"set -a && . {remote_repo}/.env && set +a && "
+        "set -a && . ~/exonit/.env && set +a && "
         f"{progress_env}"
-        f"PYTHONPATH={remote_repo} {remote_repo}/.venv/bin/python "
-        f"{remote_repo}/scripts/compact_completeness.py --pg {shlex.quote(remote_dsn)}"
+        "PYTHONPATH=~/exonit ~/exonit/.venv/bin/python "
+        f"~/exonit/scripts/compact_completeness.py --pg {shlex.quote(remote_dsn)}"
     )
     return ["ssh", "-o", "ConnectTimeout=15", host, remote_shell_cmd]
 
@@ -2368,7 +2390,7 @@ def _run_compact_service(url: str, token: str, run_id: str | None = None) -> dic
 def _finalize_compact_completeness(db_path: str, run_id: str | None = None) -> None:
     """Drain ``completeness_staging`` -> bucketed Parquet + PG aggregates.
 
-    Phase 4a Task 4: invoked once, at the end of FINALIZE, only when the
+    Fase 4a Task 4: invoked once, at the end of FINALIZE, only when the
     completeness-on-PG cutover flag (``EXONIT_COMPLETENESS_PG=1``) is ON AND
     the operational backend is PostgreSQL — the flag is meaningless with a
     SQLite main backend (see ``exonit/db.py``'s ``ExoNitDB.__init__``
@@ -2378,7 +2400,7 @@ def _finalize_compact_completeness(db_path: str, run_id: str | None = None) -> N
     2026-09-09-compactd-service-design.md): **service -> SSH -> local**.
 
     - **Service** (fastest, preferred): if BOTH ``EXONIT_COMPACT_SERVICE_URL``
-      (e.g. ``http://storage-host:8646``) and
+      (e.g. ``http://<postgres-host>:8646``) and
       ``EXONIT_COMPACT_SERVICE_TOKEN`` are set, the compaction is dispatched
       to the ``exonit-compactd`` HTTP service on <host> first
       (``_run_compact_service``) — a short ``POST`` plus 15s polls, never a
@@ -2393,8 +2415,8 @@ def _finalize_compact_completeness(db_path: str, run_id: str | None = None) -> N
       inside ``_run_compact_service``. Either env var missing/empty: this
       step is skipped entirely, unchanged behaviour.
     - **SSH** (2026-07-17, fallback #1 — kept intact, retirement is a
-      separate future change per the spec's "out of scope"): if
-      ``EXONIT_COMPACT_REMOTE_HOST`` is set (e.g. ``user@storage-host``),
+      separate future change per the spec's "fora d'abast"): if
+      ``EXONIT_COMPACT_REMOTE_HOST`` is set (e.g. ``<user>@<postgres-host>``),
       the compaction is attempted ON <host> over SSH
       (``_run_compact_remote``) — PG and MinIO both live there, so this
       removes the LAN round-trip that dominates a full pass. ANY failure of
@@ -2411,7 +2433,7 @@ def _finalize_compact_completeness(db_path: str, run_id: str | None = None) -> N
     run: ``completeness_staging`` simply keeps accumulating rows and the
     NEXT run's (or a manually-invoked) compaction absorbs everything that
     piled up since the last successful pass (docs/superpowers/plans/
-    2026-07-05-phase4-completeness-parquet.md, Task 4 WARNING note). The
+    2026-07-05-phase4-completeness-parquet.md, Task 4 ATENCIÓ note). The
     run's own health must never be gated on pending staging rows.
     """
     from exonit.completeness_store import completeness_pg_enabled
@@ -2496,7 +2518,7 @@ def _publish_finalize_substep(state_file: str, substep: str) -> None:
     """Surface which FINALIZE sub-step is running in the pipeline state.
 
     The completeness compaction can hold FINALIZE for 15-40 min with no
-    outward sign of life (operator, 2026-07-25) — the UI reads
+    outward sign of life (the owner, 2026-07-25) — the UI reads
     ``finalize_substep`` to say what the run is actually doing. Best-effort:
     a state-write failure must never affect the sub-step itself. Publish ""
     when the last sub-step ends so the field never lingers into DONE.
@@ -2582,7 +2604,7 @@ def step_finalize(
         logger.exception("FINALIZE exception (non-fatal)")
         ok, detail = True, f"exception (non-fatal): {exc}"
 
-    # Phase 4a Task 4: completeness compaction is an entirely separate concern
+    # Fase 4a Task 4: completeness compaction is an entirely separate concern
     # from the CAMPAIGN.md/STATUS.md update above (own try/except so neither
     # side can mask or block the other); a no-op when the cutover flag is
     # OFF, and non-fatal by construction when it's ON (see the helper's
@@ -2819,7 +2841,7 @@ def step_wal_checkpoint(db: str | None, dry_run: bool) -> None:
     lived sqlite connection (the orchestrator must not import ExoNitDB — that
     would re-run schema init). Any failure is logged and ignored.
 
-    Phase 4a Task 4 follow-up (f): with ``EXONIT_COMPLETENESS_PG=1`` there is
+    Fase 4a Task 4 follow-up (f): with ``EXONIT_COMPLETENESS_PG=1`` there is
     no SQLite completeness sidecar left anywhere to checkpoint (retired in
     favour of PG staging + Parquet) — this is checked FIRST, unconditionally,
     so the flag alone guarantees ``data/exonit.db`` is never opened, instead
@@ -2882,7 +2904,7 @@ def _write_pid_file(state_file: str) -> None:
 def run(args: argparse.Namespace) -> None:
     """Execute the full post-run pipeline state machine.
 
-    Phase 3 Task 3 (dispatch table + --resume + checkpoint-skip): the linear
+    Fase 3 Task 3 (dispatch table + --resume + checkpoint-skip): the linear
     step-by-step body has become a loop over a per-call HOME_SEQUENCE table
     built further down, once args/run_id/sf are settled. A fresh run still
     starts at index 0 exactly as before; ``--resume <run_id>`` instead reads
@@ -2915,7 +2937,7 @@ def run(args: argparse.Namespace) -> None:
         from exonit.config import config as _config
         args.db = _config.db_path
 
-    # Phase 3 Task 2/3: module-level dual-write gate. Set BEFORE run_id
+    # Fase 3 Task 2/3: module-level dual-write gate. Set BEFORE run_id
     # resolution (Task 2 had it just after) because --resume (Task 3) needs a
     # live DB handle to read the discovery_runs row before a run_id even
     # exists locally — for --resume, the run_id itself comes FROM that row.
@@ -2987,7 +3009,7 @@ def run(args: argparse.Namespace) -> None:
     else:
         if not args.lot_csv:
             sys.exit("--lot-csv is required unless --resume is given")
-        # Phase 3 Task 2: run_id is minted ONCE, either by the scan endpoint
+        # Fase 3 Task 2: run_id is minted ONCE, either by the scan endpoint
         # (passed via --run-id, the normal server-spawned path) or — for a
         # bare manual CLI invocation — derived here the legacy way. NEVER
         # re-derived later (step_postprocess used to call _derive_run_id
@@ -3038,7 +3060,7 @@ def run(args: argparse.Namespace) -> None:
             run_id, exc)
 
     # ------------------------------------------------------------------
-    # Dispatch table (Phase 3 Task 3): (state_name, step_fn, checkpoint_key).
+    # Dispatch table (Fase 3 Task 3): (state_name, step_fn, checkpoint_key).
     # step_fn is a zero-arg closure bound to this run's args/sf/run_id. Each
     # closure calls the module-level step_x by its BARE name (not a captured
     # reference) so tests that patch.object(orch, "step_x", ...) are honored
@@ -3382,7 +3404,7 @@ def _parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--run-id", default=None,
                    help="Run identifier minted once by the scan endpoint at "
                         "launch (discovery_s<sector>_lot<lot>_<date>), passed "
-                        "through so this process NEVER re-derives it (Phase 3 "
+                        "through so this process NEVER re-derives it (Fase 3 "
                         "Task 2 — the midnight-crossing bug). Manual CLI use "
                         "may omit it: derived the legacy way (today's UTC "
                         "date) and a discovery_runs PG row created if missing.")
@@ -3393,7 +3415,7 @@ def _parse_args(argv=None) -> argparse.Namespace:
                         "server_url come from the row, never re-typed/"
                         "re-derived — --lot-csv/--sector are not required "
                         "with this flag). A DONE run is a hard error; a "
-                        "FAILED run needs --force (Phase 3 Task 3).")
+                        "FAILED run needs --force (Fase 3 Task 3).")
     p.add_argument("--force", action="store_true",
                    help="With --resume, allow retrying a FAILED run — "
                         "resumes at the step recorded as having failed (the "

@@ -16,16 +16,10 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import subprocess
-import sys
 
 warnings.filterwarnings('ignore')
 
-# Make `exonit` importable when run as `python scripts/predownload_toi.py` (scripts/ is sys.path[0]).
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from exonit.config import config as _cfg  # noqa: E402
-
-# SPOC FITS cache root: EXONIT_NFS_CACHE (see exonit/config.py).
-CACHE_DIR = _cfg.nfs_cache_path
+CACHE_DIR = "/data/tess_cache"
 MAST_BASE = "https://mast.stsci.edu/api/v0.1/Download/file?uri="
 
 

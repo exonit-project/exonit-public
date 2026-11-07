@@ -99,6 +99,10 @@ class SharedStateBackend(ABC):
         """Delete *field* from hash *key* (no-op if absent)."""
 
     @abstractmethod
+    def hdel_json_if(self, key: str, field: str, expected: dict) -> bool:
+        """Delete a JSON hash field only when *expected* matches atomically."""
+
+    @abstractmethod
     def hkeys(self, key: str) -> list[str]:
         """Return all field names of hash *key* (empty list if key absent)."""
 
@@ -328,6 +332,17 @@ class MemoryBackend(SharedStateBackend):
             if bucket is not None:
                 bucket.pop(field, None)
 
+    def hdel_json_if(self, key: str, field: str, expected: dict) -> bool:
+        with self._lock:
+            raw = self._hashes.get(key, {}).get(field)
+            if raw is None:
+                return False
+            value = json.loads(raw)
+            if any(value.get(k) != v for k, v in expected.items()):
+                return False
+            del self._hashes[key][field]
+            return True
+
     def hkeys(self, key: str) -> list[str]:
         with self._lock:
             return list(self._hashes.get(key, {}).keys())
@@ -458,6 +473,17 @@ local previous_json = raw or '{}'
 return {previous_json, final_json}
 """
 
+_HDEL_JSON_IF_LUA = r"""
+local raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not raw then return 0 end
+local entry = cjson.decode(raw)
+local expected = cjson.decode(ARGV[2])
+for k, v in pairs(expected) do
+    if entry[k] ~= v then return 0 end
+end
+return redis.call('HDEL', KEYS[1], ARGV[1])
+"""
+
 
 def _reject_empty_list_values(value: Any, *, path: str = "") -> None:
     """Raise ``ValueError`` if *value* is, or (recursively) contains, an
@@ -561,6 +587,7 @@ class RedisBackend(SharedStateBackend):
         # back from EVALSHA to EVAL on NOSCRIPT (e.g. after a Redis restart
         # flushed the script cache) — no manual SHA bookkeeping needed here.
         self._hmutate_script = self._client.register_script(_HMUTATE_LUA)
+        self._hdel_json_if_script = self._client.register_script(_HDEL_JSON_IF_LUA)
         logger.debug(
             "RedisBackend: BlockingConnectionPool max_connections=%d timeout=%.1fs url=%s",
             max_connections,
@@ -633,6 +660,10 @@ class RedisBackend(SharedStateBackend):
 
     def hdel(self, key: str, field: str) -> None:
         self._client.hdel(key, field)
+
+    def hdel_json_if(self, key: str, field: str, expected: dict) -> bool:
+        return bool(self._hdel_json_if_script(
+            keys=[key], args=[field, json.dumps(expected)]))
 
     def hkeys(self, key: str) -> list[str]:
         return self._client.hkeys(key)

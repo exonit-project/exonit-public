@@ -103,8 +103,8 @@ TG_FLUX = 32
 # Period chunk keeps bin_idx (chunk x N int16) + counts (chunk x n_bins f32)
 # bounded: 1000 x 86k x 2B ~ 173 MB worst-case giant. Normal FFI (N~600) is
 # ~1.2 MB per 1000 periods. Same starting default as bls_metal_batch.py /
-# bls_cuda.py -- Arc's own crossover (spec §5 point 4: "f32 crossover table
-# per N... do not inherit the 20000 from CUDA") is a bench-gated follow-up, not
+# bls_cuda.py -- Arc's own crossover (spec §5 point 4: "f32 crossover
+# table per N... do not inherit CUDA's 20000") is a bench-gated follow-up, not
 # assumed here.
 _PERIOD_CHUNK_DEFAULT = 1000
 
@@ -204,7 +204,7 @@ def _log_oversized_once(n_pts, threshold):
         _size_note_logged = True
     logging.getLogger("exonit").info(
         "bls_opencl.bls_gpu_batch: N=%d points exceeds the measured f32 "
-        "GPU/CPU throughput crossover (%d, Intel Arc iGPU, 2026-07-24 "
+        "GPU/CPU throughput crossover (%d, <host> Arc iGPU, 2026-07-24 "
         "validation bench) -- this and every subsequent oversized call in "
         "this process will run on the GPU anyway (no f64 GPU fallback "
         "exists on this backend), but numba-CPU (bls_fast_batch) is "

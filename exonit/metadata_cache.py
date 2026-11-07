@@ -302,7 +302,7 @@ class MetadataCache:
         in ``ensure_metadata_bulk``, which is the basis of that function's
         idempotence guarantee (docs/superpowers/specs/
         2026-09-26-metadata-refresh-and-bulk-enqueue-design.md §2.2, "with
-        ORDER BY in step 2, fits_files ends up ordered"). All rows for a given
+        ORDER BY in step 2, fits_files stays in order"). All rows for a given
         ``tic_id`` land in the same chunk (chunking is over ``tic_ids``, not
         rows), so this ordering is exact regardless of chunk boundaries.
 
@@ -407,6 +407,18 @@ class MetadataCache:
             (filename,),
         )
         return row["full_path"] if row is not None else None
+
+    def get_fits_paths(self, filenames: Iterable[str], chunk_size: int = 500) -> Dict[str, str]:
+        """``{filename: full_path}`` for the filenames the index knows (unknown ones are absent)."""
+        names = sorted({str(f) for f in filenames})
+        out: Dict[str, str] = {}
+        for i in range(0, len(names), chunk_size):
+            batch = names[i:i + chunk_size]
+            ph = ",".join("?" * len(batch))
+            for row in self._backend.query(
+                    f"SELECT filename, full_path FROM fits_paths WHERE filename IN ({ph})", tuple(batch)):
+                out[row["filename"]] = row["full_path"]
+        return out
 
     # ------------------------------------------------------------------
     # Packed FITS index (object-storage containers)
@@ -1385,21 +1397,16 @@ def _extract_stellar_params(fits_path: str) -> Dict[str, Optional[float]]:
 
 def build_from_nfs(
     cache: MetadataCache,
-    nfs_path: Optional[str] = None,
+    nfs_path: str = "/data/tess_cache",
     extract_stellar: bool = True,
 ) -> Dict[str, int]:
     """Walk *nfs_path* for ``*_lc.fits`` files and populate *cache*.
-
-    *nfs_path* defaults to ``config.nfs_cache_path`` (``EXONIT_NFS_CACHE``).
 
     If *extract_stellar* is True, reads FITS headers to get stellar params
     (RADIUS, TEFF, LOGG, TESSMAG, RA, DEC) — one read per star.
 
     Returns a stats dict with keys ``stars_added`` and ``fits_parsed``.
     """
-    if nfs_path is None:
-        from .config import config as _config
-        nfs_path = _config.nfs_cache_path
     fits_filenames: List[str] = []
     path_entries: List[tuple] = []
     for root, _dirs, files in os.walk(nfs_path):

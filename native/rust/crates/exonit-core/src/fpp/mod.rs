@@ -8,15 +8,22 @@
 //!
 //! Spec: repo exonit `docs/superpowers/specs/2026-08-17-fpp-rust-port-design.md`.
 
+pub mod ephem;
+pub mod error;
 pub mod fold;
 pub mod inputs;
 pub mod kernels;
 pub mod npsum;
 pub mod priors;
+pub mod provenance;
+pub mod pyjson;
 pub mod rng;
 pub mod scenarios;
 pub mod stellar;
 pub mod transit;
+pub mod v2;
+
+pub use error::{FppError, FppSkipReason, FppUnavailableReason};
 
 use crate::fpp_policy::{self, FppVerdict};
 use fold::{phase_fold_bin, renorm_flux};
@@ -48,6 +55,7 @@ pub struct FppResult {
     pub gal_b: f64,
     pub n_nearby: usize,
     pub trilegal_used: bool,
+    pub kepler_unconverged_draws: u64,
 }
 
 /// Checkpoint recorder mirroring the Python golden generator's wrappers.
@@ -273,5 +281,6 @@ pub fn calc_fpp(
         gal_b: format!("{:.2}", gal_b).parse().unwrap_or(gal_b),
         n_nearby,
         trilegal_used,
+        kepler_unconverged_draws: probes.scen.kepler_unconverged_draws,
     })
 }

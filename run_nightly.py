@@ -522,9 +522,8 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.set_defaults(func=cmd_serve)
 
     cache_parser = sub.add_parser("build-cache", help="Build metadata cache from NFS FITS files")
-    cache_parser.add_argument("--nfs-path", default=config.nfs_cache_path,
-                              help="Path to NFS FITS cache (default: EXONIT_NFS_CACHE "
-                                   "or <project>/data/tess_cache)")
+    cache_parser.add_argument("--nfs-path", default="/data/tess_cache",
+                              help="Path to NFS FITS cache (default: /data/tess_cache)")
     cache_parser.set_defaults(func=cmd_build_cache)
 
     reproc_parser = sub.add_parser("reprocess",

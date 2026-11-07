@@ -1,4 +1,6 @@
-> **Notice (2026-10-18): code under major revision; contributions paused.** The pipeline is being reworked in depth (false-positive probability model, light-curve dilution handling, period aliases, vetting). The code here is an older snapshot and differs substantially from the version in progress. Pull requests and issues are paused until the next release, which will replace this snapshot. Thank you for your interest.
+> **November 2026.** The corrected false-positive model (v3) is now in production, and recomputation of old values has started. The GPU versions match the CPU reference on 100 unseen stars (Apple Metal and NVIDIA CUDA). In our test sample, no known false positive was accepted, while the previous model accepted 4 of 5. Known limits: transit period and duration estimates are still being improved, some confirmed planets are wrongly rejected, and about 40 % of stars cannot be computed yet. Results remain Confidence Level L0. Contributions remain paused.
+>
+> The published [exonit-results](https://github.com/marc252/exonit-results) tables still hold values from the previous model until they are refreshed.
 
 # ExoNit
 
@@ -20,9 +22,12 @@ and without an astrophysicist on the team, which is exactly why the Confidence L
 the blind TOI benchmark) are published in [exonit-results](https://github.com/marc252/exonit-results), under the
 same L0 disclaimer.
 
-## Revision log (development version, not yet in this snapshot)
+## Revision log
 
-What has changed in the development version since this snapshot. It will reach this repository with the next release, after the corrected false-positive model has been validated.
+What has changed, newest first.
+
+**2026-11-07**
+- FPP model v3 released. Metal and CUDA likelihood backends accepted against the CPU reference; this snapshot ships the Metal worker and the Rust CPU worker. CUDA and Intel Arc follow.
 
 **2026-10-18**
 - **False-positive probability (FPP) model reworked**, reviewed:

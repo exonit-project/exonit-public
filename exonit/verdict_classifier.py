@@ -509,6 +509,12 @@ def predict_verdict(candidate: dict, vetting_result: dict,
     every SPOC candidate, and every candidate when the new env var is unset,
     keeps byte-for-byte current behaviour.
     """
+    # FPP fix plan step 6 (v): rows carrying a new-model FPP (fpp_model_version >= 2) are
+    # NOT fed to any verdict classifier until step 12 passes; they see the legacy values
+    # (triceratops_fpp_v1/_nfpp_v1) or no FPP. Identity for every other row.
+    from exonit.fpp_model import gate_candidate_for_verdict
+    candidate = gate_candidate_for_verdict(candidate)
+
     ffi_ver = os.environ.get("EXONIT_VERDICT_FFI_VERSION", "")
     if ffi_ver and data_source == "ffi":
         if ffi_ver != "v3_tfopwg":

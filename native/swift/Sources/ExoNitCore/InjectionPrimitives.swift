@@ -18,6 +18,21 @@ public struct NumPyMT19937: Sendable {
         return (Double(a) * 67_108_864 + Double(b)) / 9_007_199_254_740_992
     }
 
+    /// NumPy RandomState's inclusive integer draw (`rk_interval`): mask the
+    /// requested maximum and reject values above it, preserving RNG order.
+    public mutating func interval(maxInclusive: UInt32) -> UInt32 {
+        var mask = maxInclusive
+        mask |= mask >> 1
+        mask |= mask >> 2
+        mask |= mask >> 4
+        mask |= mask >> 8
+        mask |= mask >> 16
+        while true {
+            let value = nextUInt32() & mask
+            if value <= maxInclusive { return value }
+        }
+    }
+
     private mutating func nextUInt32() -> UInt32 {
         if index >= 624 { twist() }
         var value = state[index]; index += 1

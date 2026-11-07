@@ -6,17 +6,17 @@ Incident 2026-08-15: the server (systemd `exonit.service`, port 8400)
 hung with the port still listening but no uvicorn worker accepting
 requests (~150 threads blocked on a futex). Killing only the `MainPID`
 is not enough -- systemd stayed in "deactivating" waiting for hung
-children (the parent process never goes away because the children hold
-it). That is why this script kills ALL pids of the service cgroup
+children (the parent process never goes away because the children keep
+it alive). That is why this script kills ALL pids of the service cgroup
 (`cgroup.procs`), not only the `MainPID`.
 
-Before killing, if `py-spy` (PYSPY_BIN) is present, a stack dump of each
-cgroup pid is captured to `data/diagnostics/serverhang_<timestamp>/`
-(bounded to 60s in total, best-effort -- never prevents the kill).
+Before killing, if `py-spy` (PYSPY_BIN) is present, a stack dump of
+every cgroup pid is captured to `data/diagnostics/serverhang_<timestamp>/`
+(bounded to 60s in total, best-effort -- it never prevents the kill).
 
 Worst-case time budget (Executor playbook: subprocess timeout of 300s):
-`systemctl show` for MainPID (10s) + forensics (60s, a real hard cap --
-the per-pid timeout is capped to whatever remains until the deadline) +
+`systemctl show` for MainPID (10s) + forensics (60s, real hard cap --
+the per-pid timeout is limited to whatever remains until the deadline) +
 kill (~instant) + health poll (`--timeout-s`, default 210s) =
 10 + 60 + 210 = **280s**, a 20s margin below the required 290s threshold
 and 20s below the Executor's real 300s timeout.
@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import signal
 import subprocess
 import sys
@@ -53,21 +52,20 @@ HEALTH_URL = "http://localhost:8400/"
 _POLL_INTERVAL_S = 5
 
 #: py-spy binary (symlink into a dedicated venv with cap_sys_ptrace -- no sudo).
-PYSPY_BIN = (os.environ.get("EXONIT_PYSPY_BIN") or shutil.which("py-spy")
-             or str(Path.home() / ".local" / "bin" / "py-spy"))
+PYSPY_BIN = os.path.expanduser("~/.local/bin/py-spy")
 
 #: Root directory where forensic dumps are stored (one subdir per incident).
 DIAGNOSTICS_ROOT = ROOT / "data" / "diagnostics"
 
 #: Global deadline of the forensic capture (incident 2026-08-15: the
-#: Executor playbook has a 300s subprocess timeout and margin must be left
+#: Executor playbook has a subprocess timeout of 300s and margin must be left
 #: for the kill + health poll -- forensics can never eat the whole budget).
-#: It is a real hard limit: the timeout passed to each `py-spy dump` is
-#: capped to the time remaining until this deadline (see
-#: `_capture_forensics`), not merely checked before LAUNCHING each dump.
+#: It is a real hard limit: the timeout passed to each `py-spy dump` is capped
+#: to the time remaining until this deadline (see `_capture_forensics`), not
+#: just checked before LAUNCHING each dump.
 _FORENSICS_DEADLINE_S = 60.0
 
-#: Maximum timeout per individual pid (`py-spy dump --pid <pid>`) -- also
+#: Maximum timeout per individual pid (`py-spy dump --pid <pid>`) -- additionally
 #: capped to the time remaining until `_FORENSICS_DEADLINE_S`.
 _PYSPY_PER_PID_TIMEOUT_S = 20
 
@@ -77,16 +75,16 @@ _MAIN_PID_TIMEOUT_S = 10
 
 
 def _read_main_pid(run_cmd: Callable) -> Optional[int]:
-    """`systemctl show -p MainPID --value exonit.service` -- no sudo, the
-    service runs as the invoking user. Returns `None` if it cannot be
-    read/parsed (the caller carries on anyway with the cgroup pids, if
+    """`systemctl show -p MainPID --value exonit.service` -- no sudo needed, the
+    service runs as the service user. Returns `None` if it cannot be
+    read/parsed (the caller continues anyway with the cgroup pids, if
     any)."""
     try:
         proc = run_cmd(
             ["systemctl", "show", "-p", "MainPID", "--value", SERVICE_NAME],
             capture_output=True, text=True, timeout=_MAIN_PID_TIMEOUT_S,
         )
-    except Exception:  # noqa: BLE001 - systemctl unavailable/failing: carry on without MainPID
+    except Exception:  # noqa: BLE001 - systemctl unavailable/failing: continue without MainPID
         return None
     out = (getattr(proc, "stdout", "") or "").strip()
     try:
@@ -97,9 +95,9 @@ def _read_main_pid(run_cmd: Callable) -> Optional[int]:
 
 
 def _read_cgroup_pids(cgroup_procs_path: Path) -> list[int]:
-    """All live pids of the service cgroup -- `cgroup.procs` is
-    readable without root under cgroup v2. Empty/missing -> `[]` (never
-    blocks; only what was found gets killed)."""
+    """All live pids of the service cgroup -- `cgroup.procs` is readable
+    without root under cgroup v2. Empty/nonexistent -> `[]` (never blocks;
+    only what was found gets killed)."""
     try:
         text = cgroup_procs_path.read_text()
     except OSError:
@@ -126,20 +124,20 @@ def _capture_forensics(
     diagnostics_root: Path = DIAGNOSTICS_ROOT,
 ) -> None:
     """`py-spy dump --pid <pid>` for each cgroup pid BEFORE the SIGKILL,
-    saved to `data/diagnostics/serverhang_<UTC timestamp>/pid<N>.txt`.
+    stored at `data/diagnostics/serverhang_<UTC timestamp>/pid<N>.txt`.
 
     Incident 2026-08-15: killing without capturing stacks first left us
-    with no forensics of the futex-lock cause. ALL of this is best-effort
-    and bounded to `_FORENSICS_DEADLINE_S` in total (a real hard limit: the
-    timeout of each dump is capped to the time remaining until the
-    deadline, not merely checked before launching it) -- no exception
+    without forensics for the cause of the futex lock. ALL of this is
+    best-effort and bounded to `_FORENSICS_DEADLINE_S` in total (real hard
+    limit: each dump's timeout is capped to the time remaining until the
+    deadline, not just checked before launching it) -- no exception
     (missing binary, timeout, pid already dead, full disk,
-    `PermissionError` when checking the binary, failing `monotonic()`...)
+    `PermissionError` when checking the binary, a failing `monotonic()`...)
     may prevent the kill that follows --
-    NOTE: this function can still raise at points not wrapped by an inner
+    NOTE: this function may still raise at points not wrapped by an inner
     `try/except` (e.g. the deadline computation); the caller
     (`restart_server`) is responsible for wrapping the WHOLE call in its
-    own `try/except`. The first pids of the cgroup get priority if the
+    own `try/except`. The first cgroup pids are prioritized if the
     deadline runs out before all of them are done."""
     if not Path(pyspy_bin).exists():
         print_fn("[restart] py-spy not available; skipping forensics")
@@ -151,7 +149,7 @@ def _capture_forensics(
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         out_dir = diagnostics_root / f"serverhang_{ts}"
         out_dir.mkdir(parents=True, exist_ok=True)
-    except Exception as exc:  # noqa: BLE001 - do not block the kill over a full disk/permissions
+    except Exception as exc:  # noqa: BLE001 - do not block the kill because of a full disk/permissions
         print_fn(f"[restart] could not create the forensics directory: {exc!r}")
         return
 
@@ -176,14 +174,15 @@ def _capture_forensics(
             (out_dir / f"pid{pid}.txt").write_text(stdout + stderr)
             print_fn(f"[restart] forensics: dump of pid {pid} saved to {out_dir / f'pid{pid}.txt'}")
         except Exception as exc:  # noqa: BLE001 - best-effort: never prevent the kill that follows
-            print_fn(f"[restart] forensics: dump of pid {pid} failed (ok, carrying on): {exc!r}")
+            print_fn(f"[restart] forensics: dump of pid {pid} failed (ok, continuing): {exc!r}")
 
 
 def _kill_pids(pids: list[int], kill_fn: Callable[[int, int], None], print_fn: Callable[[str], None]) -> None:
     """`SIGKILL` each pid, ignoring `ProcessLookupError` (already dead --
-    normal, the cgroup may include children that have already exited) and
-    `PermissionError` (should never happen, the service runs as the same
-    user, but we do not want one problematic pid to stop the others)."""
+    normal, the cgroup may include children that already exited) and
+    `PermissionError` (should never happen, the service runs as the
+    service user, but we do not want one problematic pid to stop the
+    others)."""
     for pid in pids:
         try:
             kill_fn(pid, signal.SIGKILL)
@@ -203,8 +202,8 @@ def _wait_for_health(
     print_fn: Callable[[str], None],
 ) -> bool:
     """Poll `GET HEALTH_URL` every `_POLL_INTERVAL_S` until it responds
-    (any HTTP response counts -- someone only needs to be listening and
-    accepting, not a specific status) or `timeout_s` runs out."""
+    (any HTTP response counts -- it only matters that someone is listening
+    and accepting, not a specific status) or `timeout_s` runs out."""
     deadline = monotonic() + timeout_s
     while True:
         try:
@@ -234,24 +233,24 @@ def restart_server(
     skip_forensics: bool = False,
     print_fn: Callable[[str], None] = print,
 ) -> int:
-    """Kill the whole `exonit.service` cgroup (MainPID + `cgroup.procs`) and
-    wait for systemd to restart it and for `HEALTH_URL` to respond. All
+    """Kill the whole cgroup of `exonit.service` (MainPID + `cgroup.procs`) and
+    wait for systemd to restart it and `HEALTH_URL` to respond. All
     dependencies are injectable for tests -- no real call to
     `subprocess`/`os.kill`/network outside of here.
 
     Before killing (if `py-spy` is present and `skip_forensics=False`), a
     `py-spy dump` of each cgroup pid is captured (bounded to
-    `_FORENSICS_DEADLINE_S` = 60s in total, a real hard limit -- see
-    `_capture_forensics`) to have a forensic stack of the hang. The default
-    `timeout_s` is 210s (not 240) so that the worst case -- `systemctl show`
-    (10s, `_MAIN_PID_TIMEOUT_S`) + forensics (60s) + kill (~instant) +
-    health poll (210s) = 280s -- stays below the required 290s and the
-    300s subprocess timeout of the Executor playbook (see the module
-    docstring for the full breakdown).
+    `_FORENSICS_DEADLINE_S` = 60s in total, real hard limit -- see
+    `_capture_forensics`) to have a forensic stack of the hang. `timeout_s`
+    defaults to 210s (not 240) so that the worst case -- `systemctl show`
+    (10s, `_MAIN_PID_TIMEOUT_S`) + forensics (60s) + kill (~instant) + health
+    poll (210s) = 280s -- stays below the required 290s and the 300s
+    subprocess timeout of the Executor playbook (see the module docstring
+    for the full breakdown).
 
     Returns 0 if the server responds again within `timeout_s`, 1 if not.
     `dry_run=True` only shows the pids it would kill and exits 0 without
-    touching anything (nor capturing forensics)."""
+    touching anything (it does not capture forensics either)."""
     main_pid = _read_main_pid(run_cmd)
     cgroup_pids = _read_cgroup_pids(cgroup_procs_path)
 
@@ -265,7 +264,7 @@ def restart_server(
 
     if not skip_forensics:
         # Belt-and-braces around the WHOLE call (not only the inner
-        # try/excepts of _capture_forensics): a reviewer showed that an
+        # try/except of _capture_forensics): a reviewer showed that an
         # exception in the deadline computation or in
         # `Path(pyspy_bin).exists()` (e.g. PermissionError, which
         # `pathlib.Path.exists()` does NOT swallow) escaped those inner
@@ -277,7 +276,7 @@ def restart_server(
                 pyspy_bin=pyspy_bin, diagnostics_root=diagnostics_root,
             )
         except Exception as exc:  # noqa: BLE001 - forensics always best-effort, never blocks the kill
-            print_fn(f"[restart] forensics: capture failed entirely (ok, carrying on with the kill): {exc!r}")
+            print_fn(f"[restart] forensics: capture failed entirely (ok, continuing with the kill): {exc!r}")
     else:
         print_fn("[restart] --skip-forensics: py-spy is not captured")
 

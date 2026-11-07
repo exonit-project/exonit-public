@@ -33,9 +33,30 @@ impl FppRng {
         }
     }
 
+    /// Restore a NumPy `RandomState` snapshot for targeted parity diagnostics.
+    /// Normal worker calls continue to seed through `new`.
+    pub fn from_numpy_state(
+        state: [u32; 624],
+        position: usize,
+        has_gauss: bool,
+        gauss: f64,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            mt: NumpyMt19937::from_numpy_state(state, position)?,
+            has_gauss,
+            gauss,
+        })
+    }
+
     /// `rk_double` / `random_sample` — same stream as `np.random.rand`.
     pub fn rand(&mut self) -> f64 {
         self.mt.uniform01()
+    }
+
+    /// `RandomState.randint(low, high)` for the small non-negative integer ranges used by D/B draws.
+    pub fn randint(&mut self, low: usize, high: usize) -> usize {
+        assert!(high > low && high - low <= u32::MAX as usize);
+        low + self.mt.interval((high - low - 1) as u32) as usize
     }
 
     /// `legacy_gauss` — polar Box-Muller with the one-value cache.

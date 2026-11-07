@@ -38,6 +38,13 @@ impl NumpyMt19937 {
         NumpyMt19937 { state, index: 624 }
     }
 
+    pub(crate) fn from_numpy_state(state: [u32; 624], index: usize) -> Result<Self, String> {
+        if index > 624 {
+            return Err("MT19937 position must be in 0..=624".into());
+        }
+        Ok(Self { state, index })
+    }
+
     /// Mirrors `NumPyMT19937.uniform01()` (NumPy's `random_sample`/
     /// `genrand_res53`: two 32-bit draws combined into a 53-bit mantissa).
     pub fn uniform01(&mut self) -> f64 {
@@ -58,6 +65,20 @@ impl NumpyMt19937 {
         value ^= (value << 15) & 0xEFC6_0000;
         value ^= value >> 18;
         value
+    }
+
+    /// NumPy legacy `rk_interval(max)` with rejection sampling.
+    pub fn interval(&mut self, max: u32) -> u32 {
+        let mut mask = max;
+        mask |= mask >> 1;
+        mask |= mask >> 2;
+        mask |= mask >> 4;
+        mask |= mask >> 8;
+        mask |= mask >> 16;
+        loop {
+            let value = self.next_u32() & mask;
+            if value <= max { return value; }
+        }
     }
 
     /// Mirrors `NumPyMT19937.twist()`. Sequential in-place mutation of

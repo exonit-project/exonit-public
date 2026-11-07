@@ -62,4 +62,8 @@ def try_load_mlpackage(onnx_path: str):
         # can index with result[0] the way they do with onnxruntime.
         return [np.asarray(out[name]) for name in ct_output_names]
 
+    # Exposed so callers can tell a logit output from a probability output
+    # (cnn.TransitClassifier), the same way they read
+    # session.get_outputs() on the onnxruntime path.
+    run.output_names = list(ct_output_names)
     return run

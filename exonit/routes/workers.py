@@ -26,7 +26,11 @@ from fastapi import Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from exonit import done_state, server as _server
-from exonit import stellar_gates, work_producers, work_streams
+from exonit import fpp_model, stellar_gates, work_producers, work_streams
+from exonit.fpp_readiness import (LEGACY_RELEASES_KEY, input_signature,
+                                   legacy_release_field, population_refusal,
+                                   record_refusal)
+from exonit.config import harmonic_epoch_class_enabled
 from exonit.db import _to_epoch
 from exonit.db_backend import column_exists
 from exonit.server import (
@@ -71,8 +75,8 @@ from exonit.shared_state import get_shared_state
 #: Address the fleet page shows for the server itself, and the fallback IP for
 #: any worker with no SSH hop (the instances running on the server box).
 #: Overridable via the environment so a server migration is a config change,
-#: not a code change.
-_SERVER_IP = os.environ.get("EXONIT_SERVER_IP", "127.0.0.1")
+#: not a code change (the box moved <host> -> <host> on 2026-07-24).
+_SERVER_IP = os.environ.get("EXONIT_SERVER_IP", "<server-ip>")
 
 # NOTE: _get_shared_metadata_cache / target_mass_is_uncomputable /
 # _scan_in_flight / _run_spoc_check_background are called as `_server.<name>`
@@ -580,7 +584,8 @@ def register(app, deps: ServerDeps) -> None:
                 # because the worker's heartbeat is GIL-starved during the compute
                 # and reports current_tic=None by the time it fires. Prefer it over
                 # the (stale) heartbeat value so the dashboard shows who does what.
-                bf = None if is_offline else _get_worker_backfill_tic(wid)
+                bf = None if is_offline else _get_worker_backfill_tic(
+                    wid, max_age=_server.backfill_display_max_age_s(), reap=False)
                 cur_tic = bf[0] if bf else (None if is_offline else w["current_tic"])
                 cur_status = "offline" if is_offline else ("backfill" if bf else w["status"])
                 workers_out.append({
@@ -808,7 +813,7 @@ def register(app, deps: ServerDeps) -> None:
                 # (worker-HP, out since 2026-08-07) and test artefacts
                 # (worker-sidecar-livetest) fall off the map instead of
                 # accumulating as permanent stale cards. A manifest machine
-                # is always kept, even fully offline (e.g. a laptop worker, off for
+                # is always kept, even fully offline (e.g. <host>, off for
                 # days) — it's still configured fleet, just paused.
                 in_manifest = comp in manifest_keys
                 if not in_manifest:
@@ -1158,6 +1163,15 @@ def register(app, deps: ServerDeps) -> None:
                     "primary DLQ reconciliation failed for task_id=%s",
                     task_id, exc_info=True)
 
+    def _served_task(task_id, tic_id):
+        """Payload of a primary task served to a worker. ``config`` carries the
+        server-controlled fleet flags (EXONIT_HARMONIC_EPOCH_CLASS, explicit
+        false when OFF). Python, Rust and Swift workers read ``config`` from
+        the poll response and ignore unknown keys, so old workers are
+        unaffected."""
+        return {"task_id": task_id, "tic_id": tic_id,
+                "config": {"harmonic_epoch_class": harmonic_epoch_class_enabled()}}
+
     def _primary_task_from_stream(worker_id):
         """Fase 1 (streams): serve /api/worker/task from the "primary" work
         stream instead of get_and_assign_task's scan. Idle cost: one
@@ -1247,7 +1261,7 @@ def register(app, deps: ServerDeps) -> None:
             if row is None:
                 ws.ack(item.item_key)      # gone or no longer pending
                 continue
-            return {"task_id": row["task_id"], "tic_id": row["tic_id"]}
+            return _served_task(row["task_id"], row["tic_id"])
         return _empty()
 
     @app.get("/api/worker/task")
@@ -1281,7 +1295,7 @@ def register(app, deps: ServerDeps) -> None:
                 task = db.get_and_assign_task(worker_id)
         if not task:
             return {"task_id": None, "wait_seconds": 10}
-        return {"task_id": task["task_id"], "tic_id": task["tic_id"]}
+        return _served_task(task["task_id"], task["tic_id"])
 
     @app.post("/api/worker/result")
     async def worker_result(request: Request):
@@ -1304,6 +1318,8 @@ def register(app, deps: ServerDeps) -> None:
         candidates = body.get("candidates", [])
         cnn_scores = body.get("cnn_scores", [])
         reported_status = body.get("status", "completed")
+        _gate_ids = {}       # candidate index -> stored candidate id (verdict gate inputs)
+        _gate_blank = set()  # candidate indexes whose FPP numbers were dropped
         if tic_id:
             # Replace-when-deeper (deep-rescan spec §5): read the OLD star
             # BEFORE add_star refreshes it — comparing after the upsert would
@@ -1315,7 +1331,7 @@ def register(app, deps: ServerDeps) -> None:
                 and _old_star is not None
                 and _new_n_sectors > (_old_star.get("n_sectors") or 0)
             )
-            # §2.2 (done-state design, 2026-09-26, operator decision #2): do NOT
+            # §2.2 (done-state design, 2026-09-26, the owner's decision #2): do NOT
             # overwrite an already-completed star with a later failed/aborted
             # result. add_star is REPLACE semantics (db.py's upsert()) — a
             # failure here used to blank ra/dec/n_sectors/n_datapoints on a
@@ -1363,10 +1379,34 @@ def register(app, deps: ServerDeps) -> None:
                 if work_producers.streams_enabled():
                     _star_for_em = db.get_star(tic_id)
                     _em_has_spoc = _star_for_em.get("has_spoc") if _star_for_em else None
+                # Alias phase-2 provenance: strict bool, else NULL (old worker / bad value).
+                _hec = body.get("harmonic_epoch_class")
+                if _hec is not None and not isinstance(_hec, bool):
+                    logger.warning("TIC %s: harmonic_epoch_class=%r is not a bool; not stored", tic_id, _hec)
+                    _hec = None
                 for i, c in enumerate(candidates):
                     cnn = cnn_scores[i] if i < len(cnn_scores) else None
                     fpp = c.get("triceratops_fpp")
                     nfpp = c.get("triceratops_nfpp", c.get("nfpp"))
+                    # Fixed-model fields of an in-task FPP (Python worker). A malformed set
+                    # must not mislabel the numbers as the legacy model: drop BOTH (the FPP
+                    # backfill recomputes), keep the rest of the result.
+                    try:
+                        _model_fields = fpp_model.extract_model_fields(c)
+                    except fpp_model.FppFieldError as _exc:
+                        logger.warning("TIC %s candidate %s: invalid FPP model fields (%s); "
+                                       "FPP/NFPP dropped", tic_id, i + 1, _exc)
+                        _model_fields, fpp, nfpp = {}, None, None
+                        _gate_blank.add(i)
+                    if (_model_fields.get("fpp_model_version", 0) >= fpp_model.FPP_MODEL_VERSION_NEW
+                            and not db.fpp_model_ready(_model_fields.get("fpp_model_version"))):
+                        # DDL not applied: a new-model FPP must not land in the legacy columns
+                        logger.error("TIC %s candidate %s: new-model FPP dropped, model columns "
+                                     "missing (DDL not applied)", tic_id, i + 1)
+                        _model_fields, fpp, nfpp = {}, None, None
+                        _gate_blank.add(i)
+                    _legacy = (db.peek_fpp(tic_id, c.get("candidate_num", i + 1), _run_sector)
+                               if _model_fields else None)
                     candidate_id = db.add_candidate(
                         tic_id,
                         candidate_num=c.get("candidate_num", i + 1),
@@ -1397,6 +1437,11 @@ def register(app, deps: ServerDeps) -> None:
                             else int(bool(c.get("cross_source_agreement")))),
                         sector=_run_sector,
                     )
+                    _gate_ids[i] = candidate_id
+                    if _model_fields:
+                        db.set_fpp_model_fields(candidate_id, _model_fields, legacy=_legacy)
+                    if _hec is not None:
+                        db.set_candidate_harmonic_epoch_class(candidate_id, _hec)
                     # FPP producer hook (Fase 1, Task 2): best-effort mirror
                     # of the legacy fpp_task eligibility (workers.py:805-824,
                     # see exonit.work_producers) for the row just written.
@@ -1598,8 +1643,19 @@ def register(app, deps: ServerDeps) -> None:
                 snr = c.get("snr", 0)
                 if work_producers.verdict_eligible(
                         snr, cnn, c.get("exominer_ffi_score")):
+                    # Verdict gate (step 6 (v)) + cnn-at-ingest (IR pilot finding 6): the
+                    # classifier input is the STORED, gated row, never the raw body — the
+                    # body keeps cnn in a separate cnn_scores array, so the raw dict has no
+                    # cnn_score key and the classifier would read cnn = 0. A dropped FPP
+                    # (malformed fields / DDL not applied) is blanked on top.
+                    cv = c
+                    if i in _gate_ids:
+                        cv = db.with_stored_candidate(_gate_ids[i], c)
+                    if i in _gate_blank:
+                        cv = dict(cv, triceratops_fpp=None, triceratops_nfpp=None,
+                                  triceratops_prob_planet=None, triceratops_verdict=None)
                     _get_verdict_executor().submit(
-                        _run_verdict_background, db, tic_id, c, cnn)
+                        _run_verdict_background, db, tic_id, cv, cnn)
 
         # ExoMiner: opt-in via EXONIT_ENABLE_EXOMINER_AUTO=1 (off by default
         # while Docker is only available at the central server).
@@ -2069,6 +2125,183 @@ def register(app, deps: ServerDeps) -> None:
 
     # --- FPP backfill tasks for workers ---
 
+    def _attach_fpp_geometry(payload, c, mc):
+        """Replace the stub geometry of a task about to be served by the real product geometry
+        (``fpp_model.task_geometry``), and ``tglc_near_edge`` with it.  Anything that goes wrong, or no
+        geometry at all, leaves the payload exactly as built (synthetic stub, never validated)."""
+        try:
+            entry = mc.get_entry(c["tic_id"]) or {}
+            star = None
+            if entry.get("ra") is None or entry.get("dec") is None:
+                row = db._query_one("SELECT ra, dec FROM stars WHERE tic_id = ?", (c["tic_id"],))
+                star = dict(row) if row is not None else None
+            nfs = cfg.nfs_cache_path
+            try:
+                # same bucket the /api/fits route reads packed members from, but a client with short timeouts, no retries
+                from exonit import object_store as _os
+                store = _os.header_store()
+            except Exception:
+                store = None
+            geometry, reason = fpp_model.task_geometry_ex(
+                tic_id=c["tic_id"], entry=entry, star=star,
+                paths=mc.get_fits_paths(entry.get("fits_files") or ()),
+                roots=(os.path.join(nfs, "mastDownload", "TESS"), os.path.join(nfs, "tesscut")),
+                ffi_cache_dir=cfg.fpp_ffi_wcs_cache_dir, meta=mc, store=store)
+            if geometry is not None:
+                payload["task"]["geometry"] = geometry
+                payload["task"]["tglc_near_edge"] = fpp_model._tglc_near_edge(geometry)
+            elif reason in ("budget_exceeded", "error", "breaker_open"):
+                payload["task"]["geometry"] = {"kind": "synthetic", "stub_reason": reason}   # flagged stub, never validated
+        except Exception:
+            logger.warning("fpp geometry TIC %s: lookup failed, synthetic stub",
+                           c.get("tic_id"), exc_info=True)
+        return payload
+
+    def _fpp_task_payload(c, mc):
+        """``{"task": {...}}`` of an FPP backfill task: the 9 legacy fields plus the
+        fixed-model extras (plan step 6 (iii), ``exonit.fpp_model.task_extras``):
+        ``lc_source``, ``cadence_s``, the cached Galaxia ``population`` (+
+        ``population_sha256``, ``population_version``; ``population_missing`` when
+        there is none, so the worker never goes online for it), and ``geometry``.
+        Strictly additive: an old worker ignores the new keys. A failure while
+        building extras is logged; the readiness check refuses the task.
+
+        ``geometry`` is the synthetic stub here: the real product geometry opens FITS files, so
+        ``_attach_fpp_geometry`` adds it only to a task about to be served (after the refusal check and
+        the claim), never for the up-to-200 candidates a legacy poll only inspects."""
+        payload = _build_backfill_payload(c)
+        try:
+            entry = mc.get_entry(c["tic_id"]) or {}
+            pop, pop_sha, pop_ver, hit = None, None, None, None
+            from exonit.fpp_background import (FppBackgroundStore, PopulationFamilyConfigError,
+                                               log_population_family_config_error, serve_population)
+            from exonit.fpp_galaxia_store import (GalaxiaStoreConfigError, GalaxiaStoreError,
+                                                  log_store_error)
+            try:
+                # By-TIC lookup (family, decision D2) or the legacy exact version; the served row
+                # carries its own full population_version.
+                hit = serve_population(FppBackgroundStore(db.backend), c["tic_id"])
+                if hit is not None:
+                    pop, pop_sha, pop_ver = (json.loads(hit["payload"]), hit["sha256"],
+                                             hit["population_version"])
+            except GalaxiaStoreConfigError as err:
+                # Store switch on but the store is unusable: refused (population_missing), logged once
+                # per message, never answered from the fpp_background table.
+                log_store_error(err)
+            except GalaxiaStoreError as err:
+                # One document failed its verification (or its part vanished): refused like a miss,
+                # no traceback, never answered from another population.
+                logger.warning("fpp task TIC %s: galaxia store refused the population: %s",
+                               c["tic_id"], err)
+            except PopulationFamilyConfigError as err:
+                # Misconfigured EXONIT_FPP_POPULATION_FAMILY: detected and logged once at startup
+                # (server.create_app); here it stays refused (population_missing), never picked,
+                # and is not re-logged per TIC.
+                log_population_family_config_error(err)
+            except Exception:
+                logger.warning("fpp task TIC %s: population lookup failed",
+                               c["tic_id"], exc_info=True)
+            extras = fpp_model.task_extras(
+                tic_id=c["tic_id"], exptime=entry.get("exptime"),
+                fits_files=entry.get("fits_files"), population=pop)
+            extras["population_sha256"] = pop_sha
+            extras["population_version"] = pop_ver if pop is not None else None
+            extras["population_crosscheck"] = (
+                hit.get("crosscheck") if hit is not None else None)
+            payload["task"].update(extras)
+        except Exception:
+            logger.warning("fpp task TIC %s: extras failed, task will be refused",
+                           c.get("tic_id"), exc_info=True)
+        return payload
+
+    @app.get("/api/worker/fpp_readiness")
+    def worker_fpp_readiness(request: Request, run_id: str = ""):
+        """Gate the FPP phase of ONE run on population / R8 readiness.
+
+        ``run_id`` scopes the gate to the TIC set of that run's lot (the same
+        scope mechanisms as ``/api/health/work``: ``tasks.run_id`` or
+        ``discovery_run_tics``). Without ``run_id``, or for a run with no
+        materialised TIC set, the gate falls back to the whole eligible
+        backlog (fail closed: it can only block more, never less) and says so
+        in ``scope``.
+
+        Blocking reasons (``reasons``): ``population_missing`` (no stored
+        population yet, e.g. the Galaxia fleet prefetch is still running) and
+        ``population_crosscheck_unverified`` (R8 counts not attached yet).
+        These clear by themselves when the data arrives.
+
+        Parked reasons (``parked``): ``population_alarm_unresolved``. No
+        producer of a Gaia stellar table exists, so this field can never be
+        completed; dispatch parks it (no FPP value, never a ``-1``) and it
+        must not hold the other candidates of the run back. It is still
+        reported, so the operator sees it.
+        """
+        if not _check_auth(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        from exonit.fpp_background import (current_population_version, fetch_population_rows,
+                                           population_family)
+        from exonit.fpp_readiness import PARKED_REASONS, field_refusal
+        family = population_family()
+        from exonit import fpp_galaxia_store
+        try:
+            # Store switch on: it must be usable (it requires the family); otherwise the gate stays
+            # closed instead of reading the fpp_background table.
+            fpp_galaxia_store.active_store()
+        except fpp_galaxia_store.GalaxiaStoreError as err:
+            fpp_galaxia_store.log_store_error(err)
+            return JSONResponse({"error": f"fpp population store unavailable: {err}", "ready": False,
+                                 "population_store": fpp_galaxia_store.STORE_NAME}, status_code=503)
+        version = family or current_population_version()
+        scope_kind = db.run_scope_kind(run_id) if run_id else None
+        if scope_kind == "tasks":
+            scope_sql = (" JOIN (SELECT DISTINCT tic_id FROM tasks WHERE run_id = ?) rt "
+                         "ON rt.tic_id = c.tic_id ")
+            scope_params: tuple = (run_id,)
+        elif scope_kind == "run_tics":
+            scope_sql = (" JOIN discovery_run_tics rt "
+                         "ON rt.tic_id = c.tic_id AND rt.run_id = ? ")
+            scope_params = (run_id,)
+        else:
+            scope_sql, scope_params = "", ()
+        # Only population presence and R8 metadata are needed for this gate.
+        # Never decompress/hash every population blob or issue one query per
+        # field across a fleet-sized scope; dispatch validates each blob later.
+        base_where = """
+               WHERE c.snr >= 10.0 AND (c.cnn_score >= 0.7 OR c.exominer_ffi_score >= 0.5)
+                 AND s.status = 'completed'
+                 AND (c.triceratops_fpp IS NULL OR
+                      (c.triceratops_fpp >= 0 AND c.triceratops_fpp < 0.5
+                       AND c.triceratops_nfpp IS NULL))"""
+        if family:
+            # By-TIC family: the matching row (if exactly one) is resolved from the light
+            # fpp_background columns; the candidate query does not join the store.
+            tics = db._query(work_producers.fpp_queue_sql(
+                "SELECT DISTINCT c.tic_id FROM candidates c JOIN stars s ON c.tic_id=s.tic_id"
+                + scope_sql + base_where), scope_params)
+            served = fetch_population_rows(db._query, [t["tic_id"] for t in tics], family=family)
+            none_row = {"population_version": None, "source": None, "crosscheck_json": None}
+            rows = [served.get(str(int(t["tic_id"])), {**none_row, "tic_id": t["tic_id"]})
+                    for t in tics]
+        else:
+            # Only population presence and R8 metadata are needed for this gate.
+            # Never decompress/hash every population blob or issue one query per
+            # field across a fleet-sized scope; dispatch validates each blob later.
+            rows = db._query(work_producers.fpp_queue_sql(
+                """SELECT DISTINCT c.tic_id, b.population_version, b.source, b.crosscheck_json
+                   FROM candidates c JOIN stars s ON c.tic_id=s.tic_id""" + scope_sql +
+                """ LEFT JOIN fpp_background b ON b.tic_id=c.tic_id AND b.population_version=?"""
+                + base_where), scope_params + (version,))
+        reasons, parked = {}, {}
+        for row in rows:
+            reason = field_refusal(row)
+            if reason:
+                bucket = parked if reason in PARKED_REASONS else reasons
+                bucket[reason] = bucket.get(reason, 0) + 1
+        return {"ready": not reasons, "fields": len(rows), "reasons": reasons,
+                "parked": parked, "population_version": version,
+                "scope": {"run_id": run_id or None, "scoped": scope_kind is not None,
+                          "kind": scope_kind}}
+
     _FPP_STREAM_MAX_ITERATIONS = 5  # bound one HTTP request's work, even if
                                     # a run of stale/ineligible entries lands
                                     # back to back (each iteration is one
@@ -2117,7 +2350,8 @@ def register(app, deps: ServerDeps) -> None:
             if owner_row is None:
                 return False
             return _worker_alive_and_on(workers_state, consumer,
-                                        owner_row["tic_id"])
+                                        owner_row["tic_id"],
+                                        ceiling_s=_server.fpp_hold_ceiling_s())
 
         _fpp_gate_active = os.environ.get("EXONIT_FPP_GATE") == "1"
         # Same process-wide MetadataCache the legacy path resolves before its
@@ -2181,9 +2415,10 @@ def register(app, deps: ServerDeps) -> None:
             # are gate candidates).
             if _fpp_gate_active and row.get("triceratops_fpp") is None:
                 try:
-                    if _server.target_mass_is_uncomputable(
-                            _mc, berger, row["tic_id"]):
-                        db.mark_fpp_uncomputable(candidate_id)
+                    _why = _server.target_mass_unavailable_reason(
+                        _mc, berger, row["tic_id"])
+                    if _why is not None:
+                        db.mark_fpp_uncomputable(candidate_id, reason=_why)
                         ws.ack(item.item_key)
                         continue
                     # Rp-gate (2026-07-14, stellar_gates.py): the star is
@@ -2228,8 +2463,26 @@ def register(app, deps: ServerDeps) -> None:
                     # hand the replica slot back so the next idle worker may try.
                     ws.release_replica(item.item_key)
                 continue
-            _set_worker_backfill_tic(worker_id, row["tic_id"], "FPP")
-            return _build_backfill_payload(row)
+            payload = _fpp_task_payload(row, _mc)
+            reason = population_refusal(payload["task"])
+            if reason:
+                attempts = record_refusal(get_shared_state(), candidate_id,
+                                          payload["task"], reason)
+                if item.speculative:
+                    ws.release_replica(item.item_key)
+                elif attempts >= 3:
+                    # Counted terminal parking survives reconcile/rebuilds;
+                    # no candidate sentinel and no worker/LC work.
+                    ws.ack(item.item_key)
+                else:
+                    ws.release_claim(item.item_key, worker_id, item.claim_id,
+                                     reason=reason)
+                continue
+            _set_worker_backfill_tic(
+                worker_id, row["tic_id"], "FPP", candidate_id=candidate_id)
+            _attach_fpp_geometry(payload, row, _mc)
+            payload["task"]["fpp_claim_id"] = item.claim_id
+            return payload
         return {"task": None}
 
     @app.get("/api/worker/fpp_task")
@@ -2238,7 +2491,7 @@ def register(app, deps: ServerDeps) -> None:
 
         Tracks in-memory assignments to prevent multiple idle workers from
         grabbing the same top-SNR candidate (race observed 2026-05-02:
-        <host> + a laptop worker both processed TIC 28873762 simultaneously when the
+        <host> + <host> both processed TIC 28873762 simultaneously when the
         regular task queue was empty).
         """
         if not _check_auth(request):
@@ -2283,17 +2536,19 @@ def register(app, deps: ServerDeps) -> None:
         # more permissive than before (monotonic — see
         # work_producers.verdict_eligible).
         try:
-            _fpp_arm1 = db._query_one(
+            # work_producers.fpp_queue_sql: identity unless EXONIT_FPP_CNN_NULL=1 (plan
+            # step 6: cnn-NULL arm + the matching ``_n`` partial indexes).
+            _fpp_arm1 = db._query_one(work_producers.fpp_queue_sql(
                 "SELECT 1 FROM candidates INDEXED BY idx_cand_fpp_todo "
                 "WHERE snr >= 10.0 AND (cnn_score >= 0.7 OR exominer_ffi_score >= 0.5) "
                 "AND triceratops_fpp IS NULL "
-                "ORDER BY snr DESC LIMIT 1")
-            _fpp_arm2 = None if _fpp_arm1 else db._query_one(
+                "ORDER BY snr DESC LIMIT 1"))
+            _fpp_arm2 = None if _fpp_arm1 else db._query_one(work_producers.fpp_queue_sql(
                 "SELECT 1 FROM candidates INDEXED BY idx_cand_nfpp_todo "
                 "WHERE snr >= 10.0 AND (cnn_score >= 0.7 OR exominer_ffi_score >= 0.5) "
                 "AND triceratops_fpp >= 0 "
                 "AND triceratops_fpp < 0.5 AND triceratops_nfpp IS NULL "
-                "ORDER BY snr DESC LIMIT 1")
+                "ORDER BY snr DESC LIMIT 1"))
             if not _fpp_arm1 and not _fpp_arm2:
                 return {"task": None}
         except Exception:
@@ -2318,7 +2573,7 @@ def register(app, deps: ServerDeps) -> None:
         # we catch it and re-run the original broad OR query (correct, only slower).
         _mc = _server._get_shared_metadata_cache(cfg)
         try:
-            _fpp_arm_a = db._query(
+            _fpp_arm_a = db._query(work_producers.fpp_queue_sql(
                 """SELECT c.*, s.n_sectors FROM candidates c INDEXED BY idx_cand_fpp_todo
                    JOIN stars s ON c.tic_id = s.tic_id
                    WHERE c.snr >= 10.0
@@ -2326,8 +2581,8 @@ def register(app, deps: ServerDeps) -> None:
                      AND c.triceratops_fpp IS NULL
                      AND s.status = 'completed'
                    ORDER BY c.snr DESC
-                   LIMIT 200""")
-            _fpp_arm_b = db._query(
+                   LIMIT 200"""))
+            _fpp_arm_b = db._query(work_producers.fpp_queue_sql(
                 """SELECT c.*, s.n_sectors FROM candidates c INDEXED BY idx_cand_nfpp_todo
                    JOIN stars s ON c.tic_id = s.tic_id
                    WHERE c.snr >= 10.0
@@ -2336,14 +2591,14 @@ def register(app, deps: ServerDeps) -> None:
                      AND c.triceratops_nfpp IS NULL
                      AND s.status = 'completed'
                    ORDER BY c.snr DESC
-                   LIMIT 200""")
+                   LIMIT 200"""))
             candidates = sorted(
                 _fpp_arm_a + _fpp_arm_b,
                 key=lambda _c: _c["snr"], reverse=True)[:200]
         except Exception:
             # Index missing or renamed — fall back to the original broad query.
             # Result is identical; only performance differs.
-            candidates = db._query(
+            candidates = db._query(work_producers.fpp_queue_sql(
                 """SELECT c.*, s.n_sectors FROM candidates c
                    JOIN stars s ON c.tic_id = s.tic_id
                    WHERE c.snr >= 10.0
@@ -2358,7 +2613,7 @@ def register(app, deps: ServerDeps) -> None:
                      )
                      AND s.status = 'completed'
                    ORDER BY c.snr DESC
-                   LIMIT 200""")
+                   LIMIT 200"""))
 
         # Reap stale FPP assignments (worker died silently) and pick a
         # candidate that nobody else is currently working on.
@@ -2379,6 +2634,7 @@ def register(app, deps: ServerDeps) -> None:
         _fpp_gate_active = os.environ.get("EXONIT_FPP_GATE") == "1"
 
         task_candidate = None
+        task_claim_id = None
         for c in candidates:
             cid = c["id"]
             if not _mc.get_entry(c["tic_id"]):
@@ -2386,8 +2642,9 @@ def register(app, deps: ServerDeps) -> None:
             # FPP-gate: skip (and pre-mark) uncomputable targets.
             if _fpp_gate_active and c.get("triceratops_fpp") is None:
                 try:
-                    if _server.target_mass_is_uncomputable(_mc, berger, c["tic_id"]):
-                        db.mark_fpp_uncomputable(cid)
+                    _why = _server.target_mass_unavailable_reason(_mc, berger, c["tic_id"])
+                    if _why is not None:
+                        db.mark_fpp_uncomputable(cid, reason=_why)
                         continue
                     # Rp-gate (2026-07-14): the star is fine, but THIS transit
                     # is too deep for it to be a planet — see stellar_gates.
@@ -2399,15 +2656,96 @@ def register(app, deps: ServerDeps) -> None:
                         continue
                 except Exception:
                     pass  # never let the gate break the backfill
-            if _claim_candidate(_FPP_ASSIGNMENTS_KEY, cid, now=now):
+            state = get_shared_state()
+            payload = _fpp_task_payload(c, _mc)
+            # Release budget per candidate AND population input (like the stream path): a stored
+            # population / new R8 counts change the signature and the candidate is served again.
+            input_sig = input_signature(payload["task"])
+            if (state.hget_json(LEGACY_RELEASES_KEY, legacy_release_field(cid, input_sig))
+                    or {}).get("attempts", 0) >= 3:
+                continue
+            reason = population_refusal(payload["task"])
+            if reason:
+                record_refusal(get_shared_state(), cid, payload["task"], reason)
+                continue
+            claim_id = secrets.token_hex(16)
+            if _claim_candidate(_FPP_ASSIGNMENTS_KEY, cid, now=now,
+                                worker_id=worker_id, claim_id=claim_id,
+                                input_sig=input_sig):
                 task_candidate = c
+                task_claim_id = claim_id
                 break
         if not task_candidate:
             return {"task": None}
         c = task_candidate
-        _set_worker_backfill_tic(request.headers.get("x-worker-id"),
-                                 c["tic_id"], "FPP")
-        return _build_backfill_payload(c)
+        _set_worker_backfill_tic(
+            request.headers.get("x-worker-id"), c["tic_id"], "FPP",
+            candidate_id=c["id"])
+        payload = _fpp_task_payload(c, _mc)
+        _attach_fpp_geometry(payload, c, _mc)
+        payload["task"]["fpp_claim_id"] = task_claim_id
+        return payload
+
+    @app.post("/api/worker/fpp_release")
+    async def worker_fpp_release(request: Request):
+        """Release one refused FPP assignment for immediate retry."""
+        if not _check_auth(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        worker_id = request.headers.get("x-worker-id", "")
+        if not worker_id:
+            return JSONResponse({"error": "x-worker-id required"}, status_code=400)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "JSON body must be an object"}, status_code=400)
+        try:
+            candidate_id = int(body.get("candidate_id"))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "candidate_id required"}, status_code=400)
+        if candidate_id <= 0:
+            return JSONResponse({"error": "candidate_id must be positive"}, status_code=400)
+        claim_id = body.get("claim_id")
+        if not isinstance(claim_id, str) or not claim_id:
+            return JSONResponse({"error": "claim_id required"}, status_code=400)
+
+        if work_producers.streams_enabled():
+            try:
+                outcome = work_streams.get_stream("fpp").release_claim(
+                    str(candidate_id), worker_id, claim_id,
+                    reason=str(body.get("reason", "unavailable"))[:200])
+            except Exception:
+                logger.exception("FPP claim release failed for candidate %s",
+                                 candidate_id)
+                return JSONResponse({"error": "FPP claim release failed"},
+                                    status_code=503)
+            if outcome in ("released", "replica_released", "dead_lettered"):
+                _clear_worker_backfill_tic(worker_id, candidate_id=candidate_id)
+                return {"status": outcome}
+            if outcome == "error":
+                return JSONResponse({"error": "FPP claim release failed"},
+                                    status_code=503)
+            return JSONResponse({"error": "worker does not own this FPP claim"},
+                                status_code=409)
+
+        state = get_shared_state()
+        # the input the claimed task was built from, stored at claim time; read BEFORE the delete
+        # (hdel_json_if below only succeeds for this very claim, so it cannot be another claim's)
+        input_sig = (state.hget_json(_FPP_ASSIGNMENTS_KEY, str(candidate_id)) or {}).get("input_sig")
+        released = state.hdel_json_if(
+            _FPP_ASSIGNMENTS_KEY, str(candidate_id),
+            {"worker_id": str(worker_id), "claim_id": claim_id})
+        if not released:
+            return JSONResponse({"error": "worker does not own this FPP claim"},
+                                status_code=409)
+        field = legacy_release_field(candidate_id, input_sig)
+        state.hupdate_json(LEGACY_RELEASES_KEY, field, {
+            "candidate_id": candidate_id, "input_sig": input_sig,
+            "reason": str(body.get("reason", "unavailable"))[:200]})
+        attempts = state.hincr_json_field(LEGACY_RELEASES_KEY, field, "attempts", 1)
+        _clear_worker_backfill_tic(worker_id, candidate_id=candidate_id)
+        return {"status": "parked" if attempts >= 3 else "released"}
 
     @app.post("/api/worker/fpp_result")
     async def worker_fpp_result(request: Request):
@@ -2421,6 +2759,22 @@ def register(app, deps: ServerDeps) -> None:
         nfpp = body.get("nfpp")
         prob_planet = body.get("prob_planet")
         verdict = body.get("verdict")
+        # Fixed-model fields (plan step 6): validated BEFORE anything is released or
+        # written, so a malformed result is a 400 the worker sees, not a half-labelled row.
+        try:
+            model_fields = fpp_model.extract_model_fields(body)
+        except fpp_model.FppFieldError as exc:
+            return JSONResponse({"error": f"invalid FPP model fields: {exc}"}, status_code=400)
+        # A new-model result needs the model columns. Without them it is REFUSED (503, the
+        # worker retries after the DDL) before the assignment is released: it must never be
+        # stored as a legacy-looking value. Old-model results are unaffected.
+        if (model_fields.get("fpp_model_version", 0) >= fpp_model.FPP_MODEL_VERSION_NEW
+                and not db.fpp_model_ready(model_fields.get("fpp_model_version"))):
+            logger.error("fpp_result candidate_id=%s: new-model result refused, model columns "
+                         "missing (DDL not applied)", candidate_id)
+            return JSONResponse(
+                {"error": "FPP model columns not in the database (DDL not applied); "
+                          "new-model result refused"}, status_code=503)
 
         # Adjudicate the result BEFORE writing it (2026-07-14, speculative tail
         # execution). settle() both releases the stream's assignment — the PEL
@@ -2465,7 +2819,13 @@ def register(app, deps: ServerDeps) -> None:
         if candidate_id and fpp is not None:
             db.update_candidate_fpp(candidate_id, fpp, nfpp=nfpp,
                                     prob_planet=prob_planet,
-                                    verdict=verdict)
+                                    verdict=verdict,
+                                    model_fields=model_fields or None)
+            # WHY a -1 was reported (worker skip reason, e.g. stellar_params_missing):
+            # stored so these candidates are visible and countable, not just "failed".
+            _skip = body.get("skip_reason")
+            if isinstance(_skip, str) and _skip and fpp < 0:
+                db.set_fpp_skip_reason(candidate_id, _skip)
             # Bump cumulative progress counter so /api/backfill/fpp can
             # report real done count instead of inferring it from queue
             # size (which is unreliable while the primary pipeline keeps
@@ -2479,6 +2839,9 @@ def register(app, deps: ServerDeps) -> None:
             tic_id = body.get("tic_id")
             candidate = body.get("candidate") or {}
             if tic_id and candidate:
+                # verdict gate (step 6 (v)): the classifier must see the row's model
+                # version + legacy FPP, not only the worker's own numbers.
+                candidate = db.with_fpp_gate_inputs(candidate_id, candidate)
                 _get_verdict_executor().submit(
                     _run_verdict_background, db, tic_id, candidate,
                     candidate.get("cnn_score"))
@@ -2731,7 +3094,8 @@ def register(app, deps: ServerDeps) -> None:
                               c.cnn_score, c.triceratops_fpp,
                               c.triceratops_nfpp, c.triceratops_prob_planet,
                               c.exominer_score, c.exominer_ffi_score,
-                              c.exominer_tce_period, c.exominer_sector_run
+                              c.exominer_tce_period, c.exominer_sector_run"""
+                    + db.fpp_gate_select("c") + """
                        FROM candidates c WHERE c.id = ?""",
                     (candidate_id,))
                 if cand_row:
@@ -2786,12 +3150,15 @@ def register(app, deps: ServerDeps) -> None:
         # (*.gz, *.bak, *.log, config*.json, setup_*.sh/.bat, requirements.txt)
         # are never distributed to workers.
         code_ext = {".py", ".csv"}
+        # Data files that are NOT ".json" in general (config*.json must never ship) but that worker code needs to
+        # import: whitelisted by exact name. fpp_native refuses to run FPP without its Gauss-Legendre table.
+        code_files = {"fpp_gl_tables.json"}
         model_skip_ext = {".log", ".pyc", ".pyo"}
 
         def _syncable():
             for f in sorted(worker_dir.glob("*")):
                 if f.is_file() and not f.name.startswith(".") \
-                        and f.suffix in code_ext:
+                        and (f.suffix in code_ext or f.name in code_files):
                     yield f.name
             models = worker_dir / "models"
             if models.is_dir():

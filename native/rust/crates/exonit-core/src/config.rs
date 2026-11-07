@@ -10,7 +10,7 @@
 //! `serverURL.scheme?.lowercased()` / `serverURL.host != nil` guard.
 
 use crate::cli::worker_name_validator;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,10 +119,29 @@ pub struct WorkerConfig {
     pub log_level: String,
     #[serde(rename = "exominer_mode", default = "default_exominer_mode")]
     pub exominer_mode: String,
-    #[serde(rename = "ffi_fallback_on_load_fail", default)]
+    /// python `ffi_fallback_on_load_fail` (default false): when the SPOC/FITS
+    /// light curve cannot be loaded, fall back to the server's FFI cache
+    /// (`PrimaryTaskProcessor::try_ffi_fallback`). Only a JSON bool counts.
+    #[serde(rename = "ffi_fallback_on_load_fail", default, deserialize_with = "deserialize_ffi_fallback_or_off")]
     pub ffi_fallback_on_load_fail: bool,
+    /// python `ffi_fetch_timeout` (seconds, default 30.0) of that FFI fetch.
+    #[serde(rename = "ffi_fetch_timeout", default = "default_ffi_fetch_timeout", deserialize_with = "deserialize_ffi_fetch_timeout")]
+    pub ffi_fetch_timeout: f64,
     #[serde(rename = "startup_code_sync", default)]
     pub startup_code_sync: bool,
+    /// Worker-level `gap_fill_detrend_only` (default false). A task-config
+    /// key of the same name wins for primary tasks; FPP-backfill tasks have
+    /// no config and use this value (python worker parity). Only a real JSON
+    /// bool counts: any other value (string, number, null) is ignored with a
+    /// warning and reads as false -- same rule as the Python and Swift
+    /// workers, instead of rejecting the whole config.
+    #[serde(rename = "gap_fill_detrend_only", default, deserialize_with = "deserialize_flag_or_off")]
+    pub gap_fill_detrend_only: bool,
+    /// Worker-level `harmonic_epoch_class` (alias phase 2, default false). A
+    /// bool in the task config wins (python worker precedence). Same reader
+    /// rule as `gap_fill_detrend_only`: only a JSON bool counts.
+    #[serde(rename = "harmonic_epoch_class", default, deserialize_with = "deserialize_epoch_class_or_off")]
+    pub harmonic_epoch_class: bool,
     #[serde(
         rename = "task_pools",
         default,
@@ -174,7 +193,10 @@ impl WorkerConfig {
             log_level: "INFO".to_string(),
             exominer_mode: "legacy-tfrecord".to_string(),
             ffi_fallback_on_load_fail: false,
+            ffi_fetch_timeout: 30.0,
             startup_code_sync: false,
+            gap_fill_detrend_only: false,
+            harmonic_epoch_class: false,
             task_pools: None,
             models_dir: None,
         }
@@ -284,5 +306,55 @@ fn validate_server_url_shape(url: &str) -> Option<()> {
         None
     } else {
         Some(())
+    }
+}
+
+/// `gap_fill_detrend_only` worker-config reader: a JSON bool is used as is;
+/// anything else is ignored with a warning and reads as false (python
+/// `ExoNitWorker._gap_fill_detrend_only_enabled`, Swift `WorkerConfig`).
+fn deserialize_flag_or_off<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Bool(value) => Ok(value),
+        other => {
+            eprintln!("WorkerConfig: gap_fill_detrend_only={other} is not a JSON bool; ignored (off)");
+            Ok(false)
+        }
+    }
+}
+
+/// `harmonic_epoch_class` worker-config reader (see [`deserialize_flag_or_off`]).
+fn deserialize_epoch_class_or_off<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Bool(value) => Ok(value),
+        other => {
+            eprintln!("WorkerConfig: harmonic_epoch_class={other} is not a JSON bool; ignored (off)");
+            Ok(false)
+        }
+    }
+}
+
+/// `ffi_fallback_on_load_fail` worker-config reader (see [`deserialize_flag_or_off`]).
+fn deserialize_ffi_fallback_or_off<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Bool(value) => Ok(value),
+        other => {
+            eprintln!("WorkerConfig: ffi_fallback_on_load_fail={other} is not a JSON bool; ignored (off)");
+            Ok(false)
+        }
+    }
+}
+
+fn default_ffi_fetch_timeout() -> f64 {
+    30.0
+}
+
+/// `ffi_fetch_timeout`: a positive finite JSON number; anything else keeps the python default (30 s).
+fn deserialize_ffi_fetch_timeout<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Number(n) if n.as_f64().is_some_and(|v| v.is_finite() && v > 0.0) => Ok(n.as_f64().unwrap()),
+        other => {
+            eprintln!("WorkerConfig: ffi_fetch_timeout={other} is not a positive number; using 30 s");
+            Ok(30.0)
+        }
     }
 }

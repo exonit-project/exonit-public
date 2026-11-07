@@ -16,6 +16,12 @@ public struct OutboxDrainResult: Equatable, Sendable {
     }
 }
 
+extension WorkerResultOutbox: FPPResultEnqueuing {
+    public func enqueueFPP(_ result: FPPResultRequest, workerID: String) async throws {
+        try await enqueueFPP(result, workerID: workerID, now: Date())
+    }
+}
+
 public actor WorkerResultOutbox {
     private let outbox: DurableOutbox
     private let api: WorkerAPIClient

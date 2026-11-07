@@ -104,6 +104,7 @@ struct ContractTestRunner {
             ("BLS two-pass Python parity", testBLSTwoPassParity),
             ("vetting Python golden parity", testVettingGoldenParity),
             ("CNN FFI view golden parity", testCNNFFIViewGoldenParity),
+            ("CNN FFI sparse view is nil, not a failure", testCNNSparseViewIsNil),
             ("FPP stellar golden parity", { try testFPPStellarGoldenParity() }),
             ("FPP transit golden parity", { try testFPPTransitGoldenParity() }),
             ("FPP prior golden parity", { try testFPPPriorGoldenParity() }),
@@ -117,6 +118,9 @@ struct ContractTestRunner {
             ("injection recovery Python golden parity", testInjectionRecoveryGoldenParity),
             ("long-period sweep selection", testLongPeriodSweep),
             ("long-period sweep Python golden parity", testLongPeriodSweepPythonGoldenParity),
+            ("epoch-class harmonic resolver Python golden parity (bit-exact)", testEpochClassPythonGoldenParity),
+            ("epoch-class flag OFF leaves the resolver unchanged", testEpochClassFlagOffUnchanged),
+            ("epoch-class config propagation", testEpochClassConfigPropagation),
             ("task scientific options parity", testTaskScientificOptions),
             ("primary failure and cancellation semantics", testPrimaryFailureAndCancellation),
             ("runtime requires explicit canary authorization", testRuntimeCanaryAuthorization),
@@ -146,6 +150,36 @@ struct ContractTestRunner {
             ("stitch out-of-order sectors sorted before gap fill", testStitchOutOfOrderSectorsSorted),
             ("stitch out-of-order non-cadence stitch not reordered", testStitchOutOfOrderNonCadenceNotReordered),
             ("gap fill cadence and gate semantics", testGapFillSemantics),
+            ("gap fill seeded determinism and python parity", testGapFillSeededDeterminism),
+            ("gap_fill_detrend_only off == legacy", testGapFillDetrendOnlyFlagOff),
+            ("gap_fill_detrend_only real points only, frame == flag-off series", testGapFillDetrendOnlyRealPoints),
+            ("gap_fill_detrend_only iterative pass excludes synthetic", testGapFillDetrendOnlyIterativeExcludesSynthetic),
+            ("gap_fill_detrend_only detrend frame + multi-planet", testGapFillDetrendOnlyFrameAndMultiPlanet),
+            ("gap_fill_detrend_only backfill FPP LC == in-task LC", testGapFillDetrendOnlyBackfillParity),
+            ("gap_fill_detrend_only worker config + heartbeat", testGapFillDetrendOnlyWorkerConfigAndHeartbeat),
+            ("gap_fill_detrend_only precedence table (python/rust parity)", testGapFillDetrendOnlyPrecedenceTable),
+            ("gap_fill_detrend_only long-period sweep on frame", testGapFillDetrendOnlyLongPeriodSweep),
+            ("SPOC FITS validity port (python is_valid_fits)", testFITSInvalidReasonMatchesPython),
+            ("SPOC missing FITS (404) skipped, python semantics", testSPOCMissingFITSSkipsFile),
+            ("SPOC all FITS missing fails load_failed like python", testSPOCMissingFITSAllMissingFailsLikePython),
+            ("SPOC invalid download skipped, invalid cache purged", testSPOCMissingFITSInvalidFilesAreSkippedAndCachePurged),
+            ("epoch-class task/worker precedence table", testEpochClassTaskPrecedenceTable),
+            ("epoch-class worker config + heartbeat flag", testEpochClassWorkerConfigAndHeartbeat),
+            ("epoch-class heartbeat publishes the effective value", testEpochClassHeartbeatPublishesEffectiveValue),
+            ("SPOC FITS size boundary, empty HDU, symlinks", testFITSValidityBoundariesEmptyHDUAndSymlinks),
+            ("SPOC symlinked cache entry kept", testSPOCSymlinkedCacheEntryIsKept),
+            ("SPOC invalid cached file still gets 3 attempts", testSPOCInvalidCachedFileStillGetsThreeAttempts),
+            ("ffi fallback used when all FITS missing", testFFIFallbackUsedWhenAllFilesMissing),
+            ("ffi fallback result marked recovered end-to-end", testFFIFallbackResultMarkedRecoveredEndToEnd),
+            ("ffi fallback disabled / FFI cache lacking fails load_failed", testFFIFallbackDisabledAndFFIMissingFailLikePython),
+            ("ffi fallback partial FITS never falls back", testFFIFallbackPartialFilesNeverFallBack),
+            ("ffi fallback on unreadable FITS, metadata failure, empty list", testFFIFallbackOnUnreadableFITSMetadataFailureAndEmptyList),
+            ("ffi fallback worker config strict bool + timeout + heartbeat", testFFIFallbackWorkerConfigStrictBoolTimeoutAndHeartbeat),
+            ("ffi fallback on empty light curve after cleaning", testFFIFallbackOnEmptyLightCurveAfterCleaning),
+            ("ffi fetch timeout validated", testFFIFetchTimeoutIsValidated),
+            ("epoch-class result wire key", testEpochClassResultWireKey),
+            ("epoch-class result provenance end-to-end", testEpochClassResultProvenanceEndToEnd),
+            ("task config null/absent does not crash", testTaskConfigNullDoesNotCrash),
             ("extended protocol DTOs", testExtendedProtocolDTOs),
             ("extended API routes", testExtendedAPIRoutes),
             ("binary API routes", testBinaryAPIRoutes),
@@ -1957,6 +1991,25 @@ func testGapFillSemantics() async throws {
     let dup = try GapFiller.fillIfAllowed(dupInput, noise: &dupNoise)
     try expect(dup.time == [0, 1, 1, 2], "duplicate timestamp is tolerated, matching lightkurve's fill_gaps")
     try expect(dup.flux == [1, 2, 3, 4], "duplicate timestamp inserts no filler, values pass through unchanged")
+}
+
+func testGapFillSeededDeterminism() async throws {
+    // Pinned against worker/gap_fill.py (tests/test_gap_fill_determinism.py).
+    try expect(GapFillSeed.key(ticID: "4206066", sectors: [2, 1, 2]) == "4206066:1,2", "seed key")
+    try expect(GapFillSeed.key(ticID: "5", sectors: []) == "5:", "seed key empty sectors")
+    try expect(GapFillSeed.seed(ticID: "4206066", sectors: [1, 2]) == 717703856, "seed value")
+    try expect(GapFillSeed.seed(ticID: "5", sectors: []) == 3031338238, "seed value empty")
+    var n = SeededGaussianNoiseSource(seed: 717703856)
+    try expect(n.normal(mean: 0, standardDeviation: 1) == 1.8320592014444887, "python stream 1")
+    try expect(n.normal(mean: 0, standardDeviation: 1) == -0.5550678836244881, "python stream 2")
+    try expect(n.normal(mean: 0, standardDeviation: 1) == 1.023046620261906, "python stream 3")
+    var m = SeededGaussianNoiseSource(seed: 3031338238)
+    try expect(m.normal(mean: 0, standardDeviation: 1) == -0.870363793639152, "python stream empty-sector seed")
+    let input = GapFillSeries(time: [0, 1, 2, 4.5, 5], flux: [1, 1.1, 0.9, 1, 1], cadence: nil)
+    var a = SeededGaussianNoiseSource(seed: 9), b = SeededGaussianNoiseSource(seed: 9)
+    let fa = try GapFiller.fillIfAllowed(input, noise: &a)
+    let fb = try GapFiller.fillIfAllowed(input, noise: &b)
+    try expect(fa == fb, "seeded fill repeatable")
 }
 
 func testExtendedProtocolDTOs() async throws {

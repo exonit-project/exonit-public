@@ -3,6 +3,9 @@ import Foundation
 public struct FPPStarRecord: Equatable, Sendable {
     public var id: String, ra: Double, dec: Double, mass: Double, radius: Double
     public var teff: Double, tmag: Double, parallax: Double, isTrilegal: Bool
+    /// Stellar-mass fallback provenance of the served record (task 33 item 3): the string `mass_source`,
+    /// Python `bool(giant_host)` and the string hint `mass_unavailable_reason`; a non-string is nil.
+    public var massSource: String? = nil, giantHost = false, massUnavailableReason: String? = nil
     public var weightedFlux = Double.nan, fluxRatio = Double.nan, transitDepth = Double.nan
     public init(id: String, ra: Double, dec: Double, mass: Double, radius: Double, teff: Double, tmag: Double, parallax: Double, isTrilegal: Bool = false) {
         self.id = id; self.ra = ra; self.dec = dec; self.mass = mass; self.radius = radius; self.teff = teff; self.tmag = tmag; self.parallax = parallax; self.isTrilegal = isTrilegal
@@ -17,11 +20,27 @@ public enum FPPInputs {
     private static func text(_ value: JSONValue?) -> String {
         switch value { case let .string(v): return v; case let .integer(v): return String(v); case let .number(v): return String(v); case .none: return ""; default: return "null" }
     }
+    /// Python `bool(value)` of a JSON value.
+    public static func truthy(_ value: JSONValue?) -> Bool {
+        switch value {
+        case .none, .null?: return false
+        case let .bool(x)?: return x
+        case let .integer(x)?: return x != 0
+        case let .number(x)?: return x != 0.0
+        case let .string(x)?: return !x.isEmpty
+        case let .array(x)?: return !x.isEmpty
+        case let .object(x)?: return !x.isEmpty
+        }
+    }
     public static func parseNearby(_ object: [String: JSONValue], ticID: String) -> FPPNearbyResponse? {
         guard case let .array(rawStars)? = object["stars"] else { return nil }
         var stars = rawStars.compactMap { value -> FPPStarRecord? in
             guard case let .object(s) = value else { return nil }
-            return FPPStarRecord(id: text(s["ID"]), ra: number(s["ra"]), dec: number(s["dec"]), mass: number(s["mass"]), radius: number(s["rad"]), teff: number(s["Teff"]), tmag: number(s["Tmag"]), parallax: number(s["plx"]))
+            var record = FPPStarRecord(id: text(s["ID"]), ra: number(s["ra"]), dec: number(s["dec"]), mass: number(s["mass"]), radius: number(s["rad"]), teff: number(s["Teff"]), tmag: number(s["Tmag"]), parallax: number(s["plx"]))
+            if case let .string(v)? = s["mass_source"] { record.massSource = v }
+            record.giantHost = truthy(s["giant_host"])
+            if case let .string(v)? = s["mass_unavailable_reason"] { record.massUnavailableReason = v }
+            return record
         }
         var promoted = false
         if let index = stars.firstIndex(where: { $0.id == ticID }), index != 0 { stars.insert(stars.remove(at: index), at: 0); promoted = true }

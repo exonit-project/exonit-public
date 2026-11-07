@@ -1,17 +1,18 @@
 """Playbook catalog and guarded executor (phase 1 — shadow/dry-run mode).
 
 The catalog is a closed v1 (spec §4.4): no action outside this list can be
-chosen, neither by rules nor by the local AI. The `Executor` is the only point of the
-subsystem that would "execute" a real command — and in phase 1 it never does:
+chosen, neither by rules nor by the local AI. The `Executor` is the only point
+of the subsystem that would "execute" a real command — and in phase 1 it
+never does:
 
 - `dry_run=True` by default.
 - If `dry_run=False` is requested, the environment variable
-  `EXONIT_AUTONOMY_ARMED=1` is also required (double key). Without it, the executor forces
-  `dry_run=True` anyway and notes it in the detail.
-- Every call — whether it succeeds or is refused — is recorded in `actions_log`
-  (JSONL, one line per call) for auditing.
-- Each playbook has an execution limit (per run, per lot, per 24h
-  window, or unlimited) to avoid repair loops.
+  `EXONIT_AUTONOMY_ARMED=1` is also required (double key). Without it, the
+  executor forces `dry_run=True` anyway and notes it in the detail.
+- Every call — whether it succeeds or is refused — is recorded in
+  `actions_log` (JSONL, one line per call) for auditing.
+- Each playbook has an execution limit (per run, per lot, per 24h window, or
+  unlimited) to avoid repair loops.
 
 The limit counters are persisted in `state_path` (JSON
 `{key: [iso_timestamps]}`). `reset_scope("run"|"lot")` clears only the
@@ -21,62 +22,29 @@ counters of the playbooks with that window (run/lot boundary).
 from __future__ import annotations
 
 import json
-import logging
 import os
 import subprocess
-import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-from autonomy.config import REPO_ROOT
 from autonomy.types import PlaybookChoice
 
-#: Default grace window for `detached` playbooks (fix 2026-09-19,
-#: incident "resume_run kills the orchestrator it resumes"): just enough time
-#: to detect an IMMEDIATE death of the subprocess (missing binary, invalid
-#: argument, instant crash) -- the real orchestrator runs for hours, we never
-#: wait for that to elapse.
+PY = os.environ.get("EXONIT_PYTHON", "python3")
+
+#: Default grace window for `detached` playbooks (fix 2026-09-19, incident
+#: "resume_run kills the orchestrator it resumes"): just long enough to detect
+#: an IMMEDIATE death of the subprocess (missing binary, invalid argument,
+#: instant crash) -- the real orchestrator runs for hours, and we never wait
+#: for it to finish.
 _DEFAULT_DETACHED_GRACE_S = 20.0
 
-#: Python interpreter of the subsystem (the same one running the supervisor).
-PY = sys.executable
-
-_LOG = logging.getLogger("autonomy.playbooks")
-
-#: Fleet file (name -> {ssh, platform}); `ops/autonomy_fleet.example.json`
-#: is the template. Overridable with EXONIT_AUTONOMY_FLEET.
-FLEET_FILE = Path(os.environ.get("EXONIT_AUTONOMY_FLEET")
-                  or REPO_ROOT / "ops" / "autonomy_fleet.json")
-
-
-def load_fleet(path: Path = FLEET_FILE) -> dict[str, dict]:
-    """Load the known fleet. Without a file: only `worker-default` (local)."""
-    default = {"worker-default": {"ssh": "local", "platform": "linux"}}
-    try:
-        raw = json.loads(Path(path).read_text())
-    except (OSError, ValueError) as exc:
-        _LOG.warning("fleet file %s missing or unreadable (%s) — falling back to "
-                     "worker-default only", path, exc)
-        return default
-    return {k: v for k, v in raw.items()
-            if not k.startswith("_") and isinstance(v, dict) and "ssh" in v} or default
-
-
-_FLEET = load_fleet()
-#: worker -> SSH destination ("local" for the server host).
-FLEET_WORKERS: dict[str, str] = {k: v["ssh"] for k, v in _FLEET.items()}
-#: worker -> platform ("linux" | "mac" | "windows").
-FLEET_PLATFORMS: dict[str, str] = {k: v.get("platform", "linux") for k, v in _FLEET.items()}
-
-
-def is_mac_host(name: str) -> bool:
-    """Mac according to the fleet platform; names outside the fleet: `worker-mac` prefix."""
-    if name in FLEET_PLATFORMS:
-        return FLEET_PLATFORMS[name] == "mac"
-    return name.startswith("worker-mac")
+# Known fleet (source of truth: CLAUDE.md). worker-default is local.
+FLEET_WORKERS: dict[str, str] = {
+    "worker-default": "local",
+}
 
 
 @dataclass
@@ -104,7 +72,7 @@ CATALOG: dict[str, Playbook] = {
     "rebuild_streams": Playbook(
         name="rebuild_streams",
         description=(
-            "rebuild_work_streams.py --stage <phase> (Redis<->PG drift post-restart)"
+            "rebuild_work_streams.py --stage <stage> (Redis<->PG drift after a restart)"
         ),
         allowed_params={"stage"},
         required_params={"stage"},
@@ -114,7 +82,7 @@ CATALOG: dict[str, Playbook] = {
     "requeue_orphans": Playbook(
         name="requeue_orphans",
         description=(
-            "requeue of orphaned 'assigned' tasks (age>300s, cur_tic != assigned_tic)"
+            "requeue orphaned 'assigned' tasks (age>300s, cur_tic != assigned_tic)"
         ),
         allowed_params=set(),
         required_params=set(),
@@ -123,7 +91,7 @@ CATALOG: dict[str, Playbook] = {
     ),
     "restart_worker": Playbook(
         name="restart_worker",
-        description="farmctl restart <worker> of ONE specific host",
+        description="farmctl restart <worker> on ONE specific host",
         allowed_params={"worker"},
         required_params={"worker"},
         limit_n=3,
@@ -132,7 +100,7 @@ CATALOG: dict[str, Playbook] = {
     "kill_zombies": Playbook(
         name="kill_zombies",
         description=(
-            "kill zombie server/worker processes verified by pgrep on the host"
+            "kill server/worker zombie processes verified by pgrep on the host"
         ),
         allowed_params={"host"},
         required_params={"host"},
@@ -164,7 +132,7 @@ CATALOG: dict[str, Playbook] = {
         limit_window="run",
         # Incident 2026-09-19: runs the orchestrator in the foreground for
         # hours -- with the foreground execution below (timeout=300) the
-        # `Executor` SIGKILLed it at 300s, killing the very run it was
+        # `Executor` would SIGKILL it at 300s, killing the very run it was
         # trying to resume. Must be detached (subprocess.Popen + a short
         # wait only to detect an immediate death).
         detached=True,
@@ -172,7 +140,7 @@ CATALOG: dict[str, Playbook] = {
     "restart_server": Playbook(
         name="restart_server",
         description=(
-            "kills the exonit.service cgroup (kill -9) and waits for systemd "
+            "kill the exonit.service cgroup (kill -9) and wait for systemd "
             "to restart it and /health to respond"
         ),
         allowed_params=set(),
@@ -195,11 +163,11 @@ CATALOG: dict[str, Playbook] = {
 _SCOPED_PARAM: dict[str, str] = {
     "restart_worker": "worker",
     "clean_fits_cache": "host",
-    # Incident 2026-09-19: `resume_run` limit_n=3 without scope counted
-    # GLOBALLY (3 executions IN THE WHOLE LIFETIME of the `Executor`, not 3 per
-    # run) -- with `state_path` persisting across lots, the 4th lot that ever
-    # needed a resume already found it exhausted. `run_id` is always in
-    # `params` (required, and `_tick_error` overrides it with `ctx.run_id`
+    # Incident 2026-09-19: `resume_run` with limit_n=3 and no scope counted
+    # GLOBALLY (3 executions OVER THE ENTIRE LIFETIME of the `Executor`, not 3
+    # per run) -- with `state_path` persisting across lots, the 4th lot that
+    # ever needed a resume already found it exhausted. `run_id` is always in
+    # `params` (required, and `_tick_error` overwrites it with `ctx.run_id`
     # -- never a value from the AI, see supervisor.py).
     "resume_run": "run_id",
 }
@@ -228,18 +196,11 @@ def validate(choice: PlaybookChoice) -> Optional[str]:
     return None
 
 
-def _missing_script(cmd: Optional[list[str]]) -> Optional[str]:
-    """Path of the `scripts/*.py` target of `cmd` when that file does not exist, else None."""
-    if not cmd or len(cmd) < 2 or not str(cmd[1]).startswith("scripts/"):
-        return None
-    return None if (REPO_ROOT / cmd[1]).is_file() else str(cmd[1])
-
-
 def command_for(choice: PlaybookChoice) -> Optional[list[str]]:
-    """Real command that would be executed for this choice (None for pause_and_alert).
+    """Real command that would run for this choice (None for pause_and_alert).
 
-    In phase 1 this command is never executed outside the `Executor`'s double
-    arming guard; here it is only built for logging/dry-run.
+    In phase 1 this command is never executed outside the `Executor`'s
+    double arming guard; here it is only built for logging/dry-run.
     """
     p = choice.params or {}
 
@@ -350,14 +311,14 @@ class Executor:
         `execute()` CANNOT wait for it in the foreground without the timeout
         killing it (incident 2026-09-19).
 
-        It only waits `self.detached_grace_s` to detect an
-        IMMEDIATE death (missing binary, invalid argument, instant crash) -- if
-        it is still alive after that margin, it is considered "running" and
-        returned with the PID; the real observation of whether the run has resumed is made
+        It only waits `self.detached_grace_s` to detect an IMMEDIATE death
+        (missing binary, invalid argument, instant crash) -- if it is still
+        alive after that margin, it is considered "running" and is returned
+        with the PID; the real observation of whether the run resumed is done
         by the supervisor polling the server/state, not by this subprocess.
         stdout+stderr are redirected to a file under
-        `data/autonomy/playbook_logs/` (the process is independent -- there is no
-        pipe to read from here)."""
+        `data/autonomy/playbook_logs/` (the process is independent -- there is
+        no pipe to read from here)."""
         log_dir = self._playbook_log_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
         ts = _now().strftime("%Y%m%dT%H%M%S%fZ")
@@ -384,8 +345,8 @@ class Executor:
                 "executed", f"cmd={cmd} detached=True error launching: {exc!r}"
             )
         finally:
-            # Popen has duplicated the fd for the child (or it never got
-            # launched); in both cases the parent no longer needs this
+            # Popen has duplicated the fd for the child (or the launch never
+            # happened); in both cases the parent no longer needs this
             # handle open.
             log_f.close()
 
@@ -406,7 +367,7 @@ class Executor:
 
         return ExecutionResult(
             "executed",
-            f"cmd={cmd} detached=True pid={proc.pid} alive after {self.detached_grace_s}s "
+            f"cmd={cmd} detached=True pid={proc.pid} alive past {self.detached_grace_s}s "
             f"(running in background, real observation via server/state) log={log_path}",
         )
 
@@ -476,20 +437,11 @@ class Executor:
             detail = f"would run: {cmd}{guard_note}" if cmd else f"pause_and_alert (no command){guard_note}"
             result = ExecutionResult("dry_run", detail)
         else:
-            missing = _missing_script(cmd)
-            if missing:
-                # requeue_orphans / kill_zombies / clean_fits_cache / wal_checkpoint name scripts that are not
-                # part of the repository. Say so clearly instead of letting python fail with "can't open file".
-                result = ExecutionResult(
-                    "executed",
-                    f"cmd={cmd} error=script not found: {missing} (this playbook has no implementation in "
-                    f"this checkout; nothing was run)",
-                )
-            elif cmd is None:
+            if cmd is None:
                 result = ExecutionResult("executed", "pause_and_alert: no command; alert logged")
             elif pb.detached:
-                # incident 2026-09-19: the `subprocess.run(..., timeout=300)` below
-                # SIGKILLed `resume_run` (it runs for hours in the foreground).
+                # incident 2026-09-19: the `subprocess.run(..., timeout=300)`
+                # below would SIGKILL `resume_run` (runs for hours in the foreground).
                 result = self._run_detached(cmd, choice.playbook)
             else:
                 try:

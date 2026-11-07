@@ -30,18 +30,66 @@ pub fn sample_rp(rng: &mut FppRng, n: usize, m_s: f64) -> Vec<f64> {
     let i3 = a2 * a1 * (r_max.powf(p3 + 1.0) - r_break2.powf(p3 + 1.0)) / (p3 + 1.0);
     let norm = 1.0 / (i1 + i2 + i3);
 
+    // Task 33: numpy applies its fast scalar power to the masked ARRAYS (m3's exponent is exactly 2.0 -> x * x);
+    // `powf(2.0)` only matched because LLVM lowers it to x * x when optimising, which a Debug build need not do.
     for v in x.iter_mut() {
         let u = *v;
         *v = if u <= norm * i1 {
-            (u / norm * (p1 + 1.0) + r_min.powf(p1 + 1.0)).powf(1.0 / (p1 + 1.0))
+            npow(u / norm * (p1 + 1.0) + r_min.powf(p1 + 1.0), 1.0 / (p1 + 1.0))
         } else if u <= norm * (i1 + i2) {
-            ((u / norm - i1) * (p2 + 1.0) / a1 + r_break1.powf(p2 + 1.0)).powf(1.0 / (p2 + 1.0))
+            npow((u / norm - i1) * (p2 + 1.0) / a1 + r_break1.powf(p2 + 1.0), 1.0 / (p2 + 1.0))
         } else {
-            ((u / norm - i1 - i2) * (p3 + 1.0) / (a1 * a2) + r_break2.powf(p3 + 1.0))
-                .powf(1.0 / (p3 + 1.0))
+            npow(
+                (u / norm - i1 - i2) * (p3 + 1.0) / (a1 * a2) + r_break2.powf(p3 + 1.0),
+                1.0 / (p3 + 1.0),
+            )
         };
     }
     x
+}
+
+/// `_sample_rp` with an ARRAY of host masses (plan step 4, the S family): each draw uses the exponents of ITS
+/// host (`M > 0.45: p2 = -4, else -7`). The per-group constants are computed with the exact scalar arithmetic
+/// (same `powf` calls), then applied to the selected draws with numpy's umath fast paths (`npow`).
+pub fn sample_rp_array(rng: &mut FppRng, n: usize, m_s: &[f64]) -> Vec<f64> {
+    let x = rand_vec(rng, n);
+    let (r_break1, r_break2, r_min, r_max) = (3.0f64, 6.0f64, 0.5f64, 20.0f64);
+    let (p1, p3) = (0.0f64, -0.5f64);
+    let mut out = vec![0.0f64; n];
+    for (heavy, p2) in [(true, -4.0f64), (false, -7.0f64)] {
+        let sel: Vec<usize> = (0..n).filter(|&i| (m_s[i] > 0.45) == heavy).collect();
+        if sel.is_empty() {
+            continue;
+        }
+        let a1 = r_break1.powf(p1) / r_break1.powf(p2);
+        let a2 = r_break2.powf(p2) / r_break2.powf(p3);
+        let i1 = (r_break1.powf(p1 + 1.0) - r_min.powf(p1 + 1.0)) / (p1 + 1.0);
+        let i2 = a1 * (r_break2.powf(p2 + 1.0) - r_break1.powf(p2 + 1.0)) / (p2 + 1.0);
+        let i3 = a2 * a1 * (r_max.powf(p3 + 1.0) - r_break2.powf(p3 + 1.0)) / (p3 + 1.0);
+        let norm = 1.0 / (i1 + i2 + i3);
+        for &i in &sel {
+            let u = x[i];
+            // numpy applies the umath fast paths to the selected draws (m3's exponent is
+            // exactly 2.0 -> `x * x`, 1 ULP off `pow(x, 2.0)` on some inputs).
+            out[i] = if u <= norm * i1 {
+                npow(
+                    u / norm * (p1 + 1.0) + r_min.powf(p1 + 1.0),
+                    1.0 / (p1 + 1.0),
+                )
+            } else if u <= norm * (i1 + i2) {
+                npow(
+                    (u / norm - i1) * (p2 + 1.0) / a1 + r_break1.powf(p2 + 1.0),
+                    1.0 / (p2 + 1.0),
+                )
+            } else {
+                npow(
+                    (u / norm - i1 - i2) * (p3 + 1.0) / (a1 * a2) + r_break2.powf(p3 + 1.0),
+                    1.0 / (p3 + 1.0),
+                )
+            };
+        }
+    }
+    out
 }
 
 /// `_sample_inc` — sin(i) prior, degrees.
@@ -68,6 +116,16 @@ pub fn sample_w(rng: &mut FppRng, n: usize) -> Vec<f64> {
     rand_vec(rng, n).into_iter().map(|u| u * 360.0).collect()
 }
 
+/// numpy's umath fast path for float64 arrays: an exponent of exactly 2.0 is computed as
+/// `x * x`, which can differ by 1 ULP from `pow(x, 2.0)`.
+fn npow(y: f64, e: f64) -> f64 {
+    if e == 2.0 {
+        y * y
+    } else {
+        y.powf(e)
+    }
+}
+
 /// Shared body of the two q samplers once (q_min, p1, p2, F_twin) are set.
 fn q_transform(x: &mut [f64], q_min: f64, p1: f64, p2: f64, f_twin: f64) {
     if q_min < 0.3 {
@@ -83,12 +141,20 @@ fn q_transform(x: &mut [f64], q_min: f64, p1: f64, p2: f64, f_twin: f64) {
         for v in x.iter_mut() {
             let u = *v;
             *v = if u <= norm * i1 {
-                (u / norm * (p1 + 1.0) + q_min.powf(p1 + 1.0)).powf(1.0 / (p1 + 1.0))
+                npow(
+                    u / norm * (p1 + 1.0) + q_min.powf(p1 + 1.0),
+                    1.0 / (p1 + 1.0),
+                )
             } else if u <= norm * (i1 + i2) {
-                ((u / norm - i1) * (p2 + 1.0) / a1 + 0.3f64.powf(p2 + 1.0)).powf(1.0 / (p2 + 1.0))
+                npow(
+                    (u / norm - i1) * (p2 + 1.0) / a1 + 0.3f64.powf(p2 + 1.0),
+                    1.0 / (p2 + 1.0),
+                )
             } else {
-                ((u / norm - i1 - i2) * (p2 + 1.0) / (a1 * a2) + 0.95f64.powf(p2 + 1.0))
-                    .powf(1.0 / (p2 + 1.0))
+                npow(
+                    (u / norm - i1 - i2) * (p2 + 1.0) / (a1 * a2) + 0.95f64.powf(p2 + 1.0),
+                    1.0 / (p2 + 1.0),
+                )
             };
         }
     } else {
@@ -102,9 +168,15 @@ fn q_transform(x: &mut [f64], q_min: f64, p1: f64, p2: f64, f_twin: f64) {
         for v in x.iter_mut() {
             let u = *v;
             *v = if u <= norm * i2 {
-                (u / norm * (p2 + 1.0) + q_min.powf(p2 + 1.0)).powf(1.0 / (p2 + 1.0))
+                npow(
+                    u / norm * (p2 + 1.0) + q_min.powf(p2 + 1.0),
+                    1.0 / (p2 + 1.0),
+                )
             } else {
-                ((u / norm - i2) * (p2 + 1.0) / a2 + 0.95f64.powf(p2 + 1.0)).powf(1.0 / (p2 + 1.0))
+                npow(
+                    (u / norm - i2) * (p2 + 1.0) / a2 + 0.95f64.powf(p2 + 1.0),
+                    1.0 / (p2 + 1.0),
+                )
             };
         }
     }
@@ -124,6 +196,20 @@ pub fn sample_q(rng: &mut FppRng, n: usize, m_s: f64) -> Vec<f64> {
         0.1 / m_s
     } else {
         return vec![1.0; n];
+    };
+    q_transform(&mut x, q_min, 0.3, -0.5, 0.30);
+    x
+}
+
+/// Transform an already-consumed vector of uniforms with the scalar host-mass
+/// parameters used by `_sample_q` (BEB's `FPP_BACKGROUND_Q=host` path).
+pub fn sample_q_from_uniforms(mut x: Vec<f64>, m_s: f64) -> Vec<f64> {
+    let q_min = if m_s >= 1.0 {
+        0.1
+    } else if m_s > 0.1 {
+        0.1 / m_s
+    } else {
+        return vec![1.0; x.len()];
     };
     q_transform(&mut x, q_min, 0.3, -0.5, 0.30);
     x

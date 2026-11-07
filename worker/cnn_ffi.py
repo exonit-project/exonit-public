@@ -53,12 +53,20 @@ class FFITransitClassifier:
                                             providers=providers)
         self.backend = f"ONNX-{describe_active_provider(self.session)}"
 
-    def classify(self, time, flux, period, t0, duration) -> float:
+    def classify(self, time, flux, period, t0, duration) -> float | None:
         try:
             g = global_view(time, flux, period, t0, duration).astype(np.float32)
             l = local_view(time, flux, period, t0, duration).astype(np.float32)
         except ViewError:
-            return 0.0  # sparse → conservative reject
+            # Sparse view (<5 points in the window, span < half the window,
+            # or every bin empty): the CNN cannot score this candidate.
+            # Return None = "CNN not available", NOT 0.0. A 0.0 here was
+            # indistinguishable from a genuine low score and made
+            # should_run_triceratops skip FPP; None lets FPP run
+            # (conservative) and is stored as a NULL cnn_score. Same
+            # behaviour as the Rust/Swift workers.
+            # docs/reviews/2026-10-15-cnn-exact-zero-scores.md, fix 2.
+            return None
         feed = {
             "global_view": g.reshape(1, 1, -1),
             "local_view": l.reshape(1, 1, -1),

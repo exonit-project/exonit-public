@@ -5,7 +5,7 @@
 use crate::detrend::{self, DetrendError};
 use crate::detrend_iterative::{self, QuickBlsSearch};
 use crate::fits::{LightCurveData, PhotometrySource};
-use crate::gaps::{fill_if_allowed, GapFillError, GapFillSeries, SystemGaussianNoiseSource};
+use crate::gaps::{fill_if_allowed_tracked, GapFillError, GapFillSeries, SeededGaussianNoiseSource};
 use crate::statistics::{median_or, nan_median};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -15,6 +15,100 @@ pub struct ProcessedLightCurve {
     pub raw_flux: Vec<f64>,
     pub sector_count: usize,
     pub max_gap_days: f64,
+    /// `gap_fill_detrend_only` only (config flag, default off): the full
+    /// real+synthetic series the detrend saw. `time`/`flat_flux`/`raw_flux`
+    /// above then hold real points only, and every later re-detrend
+    /// (multi-planet loop, long-period sweep) must go through this frame.
+    /// `None` when the flag is off or the gap fill added no point.
+    pub detrend_frame: Option<DetrendFrame>,
+}
+
+/// Mirrors python `worker/gap_fill.py::DetrendFrame` (config flag
+/// `gap_fill_detrend_only`, docs/reviews/2026-10-15-fill-gaps-sigma-parity.md
+/// option A). Gap-fill points exist only to bridge intra-sector gaps for the
+/// biweight detrender (otherwise `break_tolerance` splits the curve and
+/// `edge_cutoff` NaNs real cadences next to every gap); they never reach BLS.
+/// `time`/`raw_flux` are the sorted, finite full series the first detrend
+/// produced (identical to the flag-off `ProcessedLightCurve` arrays);
+/// `real_index` selects the real points (= the arrays handed to BLS).
+/// Transit masks are given on real points and scattered with `false` on the
+/// synthetic points (no transit signal; they always stay in the trend fit).
+/// This is the one deliberate deviation from flag off, where the phase-based
+/// masks also cover synthetic points inside a transit window. With the flag
+/// on, the multi-planet 30 % mask-coverage gate counts real points only.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DetrendFrame {
+    pub time: Vec<f64>,
+    pub raw_flux: Vec<f64>,
+    pub real_index: Vec<usize>,
+}
+
+impl DetrendFrame {
+    pub fn new(time: Vec<f64>, raw_flux: Vec<f64>, synthetic: &[bool]) -> Result<Self, PreprocessError> {
+        if time.len() != raw_flux.len() || time.len() != synthetic.len() {
+            return Err(PreprocessError::LengthMismatch);
+        }
+        let real_index = (0..synthetic.len()).filter(|&i| !synthetic[i]).collect();
+        Ok(DetrendFrame { time, raw_flux, real_index })
+    }
+
+    pub fn synthetic_count(&self) -> usize {
+        self.time.len() - self.real_index.len()
+    }
+
+    /// Real-point mask -> full-series mask (`false` on synthetic points).
+    pub fn expand_mask(&self, mask_real: &[bool]) -> Result<Vec<bool>, DetrendError> {
+        if mask_real.len() != self.real_index.len() {
+            return Err(DetrendError::MaskLengthMismatch);
+        }
+        let mut full = vec![false; self.time.len()];
+        for (k, &i) in self.real_index.iter().enumerate() {
+            full[i] = mask_real[k];
+        }
+        Ok(full)
+    }
+
+    /// Values of a full-series array at the real points.
+    pub fn gather(&self, full: &[f64]) -> Vec<f64> {
+        self.real_index.iter().map(|&i| full[i]).collect()
+    }
+
+    /// `detrend::flatten_with_params` on the full series, returned at the real
+    /// points only (python `DetrendFrame.detrend`).
+    pub fn flatten_with_params(
+        &self,
+        window_length: f64,
+        edge_cutoff: f64,
+        break_tolerance: f64,
+        cval: f64,
+        transit_mask_real: Option<&[bool]>,
+    ) -> Result<Vec<f64>, DetrendError> {
+        let full_mask = match transit_mask_real {
+            Some(m) => Some(self.expand_mask(m)?),
+            None => None,
+        };
+        let flat = detrend::flatten_with_params(
+            &self.time,
+            &self.raw_flux,
+            window_length,
+            edge_cutoff,
+            break_tolerance,
+            cval,
+            full_mask.as_deref(),
+        )?;
+        Ok(self.gather(&flat))
+    }
+
+    /// [`Self::flatten_with_params`] at wotan defaults (== `detrend::flatten`).
+    pub fn flatten(&self, transit_mask_real: Option<&[bool]>) -> Result<Vec<f64>, DetrendError> {
+        self.flatten_with_params(
+            detrend::DEFAULT_WINDOW_LENGTH,
+            detrend::DEFAULT_EDGE_CUTOFF,
+            detrend::DEFAULT_BREAK_TOLERANCE,
+            detrend::DEFAULT_CVAL,
+            transit_mask_real,
+        )
+    }
 }
 
 /// Unified error type for `process()`. Swift's `throws` is untyped and lets
@@ -87,12 +181,37 @@ pub struct PreparedLightCurve {
     pub time: Vec<f64>,
     pub raw: Vec<f64>,
     pub max_gap_days: f64,
+    /// Aligned with `time`: `true` = point created by the gap fill (all
+    /// `false` when no fill happened). Consumed only by `gap_fill_detrend_only`.
+    pub synthetic: Vec<bool>,
 }
 
 /// Stitch -> clean -> positive sigma clip -> conditional gap fill. Mirrors
 /// the first half of `LightCurvePreprocessor.process` (everything before the
 /// detrend call).
+///
+/// Gap-fill noise is seeded from the data itself (see [`data_fill_seed`]) so
+/// the result is deterministic even for callers that know no TIC; the task
+/// processor uses [`prepare_seeded`] with the normative (tic, sectors) seed.
 pub fn prepare(curves: &[LightCurveData]) -> Result<PreparedLightCurve, PreprocessError> {
+    prepare_seeded(curves, data_fill_seed(curves))
+}
+
+/// Fallback gap-fill seed for callers without a TIC id: FNV-1a over the
+/// number of curves, and each curve's length and first/last time bits.
+pub fn data_fill_seed(curves: &[LightCurveData]) -> u32 {
+    let mut bytes: Vec<u8> = Vec::new();
+    bytes.extend_from_slice(&(curves.len() as u64).to_le_bytes());
+    for c in curves {
+        bytes.extend_from_slice(&(c.time.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&c.time.first().copied().unwrap_or(0.0).to_bits().to_le_bytes());
+        bytes.extend_from_slice(&c.time.last().copied().unwrap_or(0.0).to_bits().to_le_bytes());
+    }
+    crate::gaps::fnv1a_u32(&bytes)
+}
+
+/// [`prepare`] with an explicit gap-fill seed (`gaps::gap_fill_seed(tic, sectors)`).
+pub fn prepare_seeded(curves: &[LightCurveData], fill_seed: u32) -> Result<PreparedLightCurve, PreprocessError> {
     if curves.is_empty() {
         return Err(PreprocessError::EmptyInput);
     }
@@ -179,17 +298,33 @@ pub fn prepare(curves: &[LightCurveData]) -> Result<PreparedLightCurve, Preproce
         }
     }
     // Python calls fill_gaps only when the largest observed gap is strictly
-    // below five days; its production RNG is deliberately unseeded.
+    // below five days; the noise is now seeded (fill-gaps-determinism).
+    let mut synthetic = vec![false; time.len()];
     if time.len() > 1 && max_gap < 5.0 {
-        let mut noise = SystemGaussianNoiseSource::new();
+        // Mirrors Swift `LightCurvePreprocessor`: lightkurve's fill_gaps()
+        // re-sorts by cadence number (`ncad[np.argsort(ncad)]`) on the
+        // cadenceno path, so a multi-sector SPOC stitch loaded in
+        // non-chronological order comes back time-ordered. Reproduce that
+        // side effect (stable sort, index-aligned) only when cadence is
+        // present; the time-grid branch (TGLC/FFI) never pre-sorts in Python.
+        // The max-gap gate above intentionally stays on the pre-sort order.
+        if let Some(c) = cadence.as_mut() {
+            let mut order: Vec<usize> = (0..time.len()).collect();
+            order.sort_by(|&a, &b| time[a].partial_cmp(&time[b]).unwrap_or(std::cmp::Ordering::Equal));
+            time = order.iter().map(|&i| time[i]).collect();
+            raw = order.iter().map(|&i| raw[i]).collect();
+            *c = order.iter().map(|&i| c[i]).collect();
+        }
+        let mut noise = SeededGaussianNoiseSource::new(fill_seed);
         let series = GapFillSeries {
             time: time.clone(),
             flux: raw.clone(),
             cadence: cadence.clone(),
         };
-        let filled = fill_if_allowed(series, 5.0, 1.2, None, &mut noise)?;
+        let (filled, added) = fill_if_allowed_tracked(series, 5.0, 1.2, None, &mut noise)?;
         time = filled.time;
         raw = filled.flux;
+        synthetic = added;
         // ProcessedLightCurve has no cadence field; it only drives gap-grid
         // selection above.
     }
@@ -198,6 +333,7 @@ pub fn prepare(curves: &[LightCurveData]) -> Result<PreparedLightCurve, Preproce
         time,
         raw,
         max_gap_days: max_gap,
+        synthetic,
     })
 }
 
@@ -221,18 +357,59 @@ pub fn process_with_backend(
     mode: DetrendMode,
     detrend_backend: &detrend::DetrendBackend,
 ) -> Result<ProcessedLightCurve, PreprocessError> {
-    let prepared = prepare(curves)?;
+    process_with_backend_seeded(curves, mode, detrend_backend, data_fill_seed(curves))
+}
+
+/// [`process_with_backend`] with an explicit gap-fill seed.
+pub fn process_with_backend_seeded(
+    curves: &[LightCurveData],
+    mode: DetrendMode,
+    detrend_backend: &detrend::DetrendBackend,
+    fill_seed: u32,
+) -> Result<ProcessedLightCurve, PreprocessError> {
+    process_with_backend_seeded_opts(curves, mode, detrend_backend, fill_seed, false)
+}
+
+/// [`process_with_backend_seeded`] plus the `gap_fill_detrend_only` config
+/// flag (task config, default false; mirrors python `_load_star`). Off: the
+/// legacy path, bit-identical. On (and the gap fill added points): the
+/// detrend runs on the real+synthetic series, the quick BLS and transit mask
+/// of the iterative pass ignore synthetic points, the renormalisation median
+/// is taken over real points, and the synthetic points are dropped from the
+/// returned arrays after the sort/finite filter, the full series being kept
+/// in `detrend_frame` for the later re-detrends.
+pub fn process_with_backend_seeded_opts(
+    curves: &[LightCurveData],
+    mode: DetrendMode,
+    detrend_backend: &detrend::DetrendBackend,
+    fill_seed: u32,
+    gap_fill_detrend_only: bool,
+) -> Result<ProcessedLightCurve, PreprocessError> {
+    let prepared = prepare_seeded(curves, fill_seed)?;
     let time = prepared.time;
     let raw = prepared.raw;
     let max_gap = prepared.max_gap_days;
+    let synthetic: Option<Vec<bool>> =
+        if gap_fill_detrend_only && prepared.synthetic.iter().any(|&s| s) { Some(prepared.synthetic) } else { None };
 
     let mut flat: Vec<f64> = match mode {
         DetrendMode::Iterative(search) => {
-            detrend_iterative::flatten_with_backend(&time, &raw, search, detrend_iterative::DEFAULT_SNR_THRESHOLD, detrend_backend)?.flux
+            detrend_iterative::flatten_with_backend_excluding(
+                &time,
+                &raw,
+                search,
+                detrend_iterative::DEFAULT_SNR_THRESHOLD,
+                detrend_backend,
+                synthetic.as_deref(),
+            )?
+            .flux
         }
         DetrendMode::Biweight => detrend::flatten_with_backend(&time, &raw, None, detrend_backend)?,
     };
-    let flat_median = nan_median(&flat);
+    let flat_median = match &synthetic {
+        None => nan_median(&flat),
+        Some(syn) => nan_median(&(0..flat.len()).filter(|&i| !syn[i]).map(|i| flat[i]).collect::<Vec<_>>()),
+    };
     if flat_median > 1.5 || flat_median < 0.5 {
         for value in flat.iter_mut() {
             *value /= flat_median;
@@ -244,12 +421,24 @@ pub fn process_with_backend(
     let mut sorted_time: Vec<f64> = Vec::with_capacity(order.len());
     let mut sorted_flat: Vec<f64> = Vec::with_capacity(order.len());
     let mut sorted_raw: Vec<f64> = Vec::with_capacity(order.len());
+    let mut sorted_synthetic: Vec<bool> = Vec::new();
     for index in order {
         if time[index].is_finite() && flat[index].is_finite() && raw[index].is_finite() {
             sorted_time.push(time[index]);
             sorted_flat.push(flat[index]);
             sorted_raw.push(raw[index]);
+            if let Some(syn) = &synthetic {
+                sorted_synthetic.push(syn[index]);
+            }
         }
+    }
+    let mut detrend_frame = None;
+    if synthetic.is_some() {
+        let frame = DetrendFrame::new(sorted_time, sorted_raw, &sorted_synthetic)?;
+        sorted_flat = frame.gather(&sorted_flat);
+        sorted_time = frame.gather(&frame.time);
+        sorted_raw = frame.gather(&frame.raw_flux);
+        detrend_frame = Some(frame);
     }
     Ok(ProcessedLightCurve {
         time: sorted_time,
@@ -257,6 +446,7 @@ pub fn process_with_backend(
         raw_flux: sorted_raw,
         sector_count: curves.len(),
         max_gap_days: max_gap,
+        detrend_frame,
     })
 }
 
@@ -329,6 +519,28 @@ mod tests {
         let result = process(&[first, second], DetrendMode::Biweight).unwrap();
         assert!(!result.raw_flux.is_empty());
         assert!(result.raw_flux.iter().all(|&v| (v - 1.0).abs() < 1e-7));
+    }
+
+    /// Parity with Swift LightCurvePreprocessor (fill-gaps pre-sort): two
+    /// adjacent SPOC sectors (cadence present) stitched out of chronological
+    /// order must be time-sorted before gap fill instead of failing with
+    /// NonMonotonicTime; a cadence hole is still filled.
+    #[test]
+    fn out_of_order_adjacent_cadence_segments_are_sorted_before_fill() {
+        let dt = 0.02;
+        let early_cad: Vec<i64> = (0..100).filter(|&i| i != 50).collect();
+        let late_cad: Vec<i64> = (150..250).collect();
+        let segment = |cad: &[i64]| LightCurveData {
+            time: cad.iter().map(|&c| c as f64 * dt).collect(),
+            flux: vec![100.0; cad.len()],
+            raw_row_count: cad.len(),
+            cadence: Some(cad.to_vec()),
+            source: PhotometrySource::Unknown,
+        };
+        let prepared = prepare_seeded(&[segment(&late_cad), segment(&early_cad)], 7).unwrap();
+        assert!(prepared.time.windows(2).all(|w| w[1] >= w[0]));
+        assert_eq!(prepared.time.len(), 250);
+        assert_eq!(prepared.time.len(), prepared.raw.len());
     }
 
     #[test]

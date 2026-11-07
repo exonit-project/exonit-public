@@ -13,10 +13,6 @@ def _sqlite_fallback_file_exists(path: str) -> bool:
     return os.path.exists(path)
 
 
-def _is_pg_dsn(url) -> bool:
-    return bool(url) and str(url).lower().startswith(("postgresql://", "postgres://"))
-
-
 class ExoNitConfig:
     """Configuration loaded from environment variables with sensible defaults."""
 
@@ -82,25 +78,13 @@ class ExoNitConfig:
             "EXONIT_BERGER_DB",
             os.path.join(self.project_root, "data", "catalogs",
                          "berger_2023_stellar.db"))
-        # SPOC FITS cache root (an NFS mount on a multi-host deployment).
-        # EXONIT_NFS_CACHE is the long-standing name; EXONIT_TESS_CACHE_DIR
-        # is accepted as an alias. Neutral default: <project>/data/tess_cache.
-        _cache_env = (os.environ.get("EXONIT_NFS_CACHE")
-                      or os.environ.get("EXONIT_TESS_CACHE_DIR"))
-        self.nfs_cache_path = _cache_env or os.path.join(
-            self.project_root, "data", "tess_cache")
-        # Same footgun class as B9: production (PostgreSQL) used to get its SPOC
-        # root from a code default; with no cache variable set the process would
-        # silently read an empty <project>/data/tess_cache. PostgreSQL is the
-        # production marker, so only then is the absence worth an ERROR.
-        if not _cache_env and _is_pg_dsn(_database_url):
-            _msg = (
-                f"neither EXONIT_NFS_CACHE nor EXONIT_TESS_CACHE_DIR is set while "
-                f"EXONIT_DATABASE_URL is PostgreSQL — using {self.nfs_cache_path!r}, "
-                f"which is probably empty. Set EXONIT_NFS_CACHE to the SPOC FITS cache."
-            )
-            LOG.error(_msg)
-            print(f"ERROR: exonit.config: {_msg}", file=sys.stderr)
+        self.nfs_cache_path = os.environ.get(
+            "EXONIT_NFS_CACHE", "/data/tess_cache")
+        # FPP product geometry (exonit.fpp_model.task_geometry): the K-epoch FFI WCS cache built by
+        # scripts/fpp/ffi_wcs_build_cache.py (one ffi_wcs_sNNNN.json per sector).  A sector without an entry
+        # is flagged in the task geometry (never validated), so a missing directory only costs quality.
+        self.fpp_ffi_wcs_cache_dir = os.environ.get(
+            "EXONIT_FPP_FFI_WCS_CACHE", os.path.expanduser("~/exonit-cache/ffi_wcs"))
         self.worker_token = os.environ.get(
             "EXONIT_WORKER_TOKEN", "exonit-default-token")
 
@@ -131,3 +115,25 @@ def worker_token() -> str:
     cross-deployment token mismatch (401) cannot happen.
     """
     return os.environ.get("EXONIT_WORKER_TOKEN", "exonit-default-token")
+
+
+def harmonic_epoch_class_enabled() -> bool:
+    """Fleet-wide switch for the alias phase-2 flag ``harmonic_epoch_class``.
+
+    Read live from ``EXONIT_HARMONIC_EPOCH_CLASS``: unset or ``0`` -> False
+    (default, bit-identical to the pre-phase-2 pipeline), ``1`` -> True.
+    Anything else raises ``ValueError`` (strict 0/1: a typo such as ``true``
+    must never silently leave the fleet OFF, or ON). ``create_app`` calls this
+    once at startup so a bad value stops the server instead of failing on the
+    first worker poll. The value is served to every worker in
+    ``config.harmonic_epoch_class`` of the /api/worker/task response.
+    """
+    raw = os.environ.get("EXONIT_HARMONIC_EPOCH_CLASS")
+    if raw is None or raw == "":
+        return False
+    if raw == "0":
+        return False
+    if raw == "1":
+        return True
+    raise ValueError(
+        f"EXONIT_HARMONIC_EPOCH_CLASS must be 0 or 1, got {raw!r}")

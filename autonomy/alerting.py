@@ -1,11 +1,10 @@
-"""Email alerting with rate limiting (phase 1 — shadow mode).
+"""Email alerting with rate-limiting (phase 1 — shadow mode).
 
-`Mailer.send()` is the single entry point for notifying events of the
-autonomy subsystem. It applies a per-`event_type` rate limit (1 email/hour/type)
-using a JSON state file persisted on disk, and supports a `dry_run` mode
-that logs what would have been sent without opening any SMTP connection —
-useful for phase 1 (shadow mode) and for tests (which must never open real
-sockets).
+`Mailer.send()` is the single entry point for notifying events from the
+autonomy subsystem. It applies a rate limit per `event_type` (1 mail/hour/type)
+using a JSON state file persisted on disk, and supports a `dry_run` mode that
+records what would have been sent without opening any SMTP connection — useful
+for phase 1 (shadow mode) and for tests (which must never open real sockets).
 
 CLI: `python -m autonomy.alerting --event ... --subject ... --body ...`,
 used by the Task 9 watchdog.
@@ -32,11 +31,11 @@ _RATE_LIMIT_S = 3600
 
 
 class Mailer:
-    """Sends email alerts with a per-`event_type` rate limit.
+    """Send email alerts with a rate limit per `event_type`.
 
-    `state_path` is a JSON file `{event_type: iso_ts_last_send}`
-    that persists the rate limit across invocations (the CLI runs as a
-    separate process each time).
+    `state_path` is a JSON file `{event_type: iso_ts_last_send}` that
+    persists the rate limit across invocations (the CLI runs as a separate
+    process each time).
     """
 
     def __init__(self, cfg: MailConfig, state_path: Path, dry_run: bool = True):
@@ -83,7 +82,7 @@ class Mailer:
     def send(self, event_type: str, subject: str, body: str) -> str:
         """Send (or simulate) an alert for `event_type`. Never raises.
 
-        Retorna: `disabled` | `suppressed` | `dry_run` | `sent`.
+        Returns: `disabled` | `suppressed` | `dry_run` | `sent`.
         """
         if not self.cfg.enabled:
             return "disabled"
@@ -107,16 +106,17 @@ class Mailer:
 
 
 def run_alert_hook(cfg: AlertConfig, subject: str, body: str) -> Optional[str]:
-    """Invoke the optional external hook `alert.command` (2026-09-19, unattended
-    run of 1-2 months) with the subject/body of an alert. Independent of the
-    `Mailer` (which stays disabled by default, no App Password) --
-    this path depends on neither SMTP nor any particular service; the operator
-    plugs in whatever they want (`bin/exonit-alert` placeholder by default).
+    """Invoke the optional external hook `alert.command` (2026-09-19, run
+    unattended for 1-2 months) with the subject/body of an alert. Independent
+    of `Mailer` (which stays disabled by default, with no App Password) --
+    this path depends neither on SMTP nor on any particular service; the
+    operator plugs in whatever they want (`bin/exonit-alert` placeholder by
+    default).
 
-    NEVER raises: any failure (missing command, not executable, timeout)
-    is logged and returned as a result, not as an exception -- this hook
-    must never bring down the armed loop. Returns `None` if `cfg.command`
-    is not configured (no-op, default)."""
+    NEVER raises: any failure (missing command, not executable, timeout) is
+    logged and returned as a result, not as an exception -- this hook must
+    never bring down the armed loop. Returns `None` if `cfg.command` is not
+    configured (no-op, default)."""
     command = cfg.command
     if not command:
         return None

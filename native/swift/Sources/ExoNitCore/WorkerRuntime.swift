@@ -5,6 +5,7 @@ public enum WorkerRuntimeError: Error, CustomStringConvertible, Sendable {
     case unsupportedTaskPools([String])
     case missingScienceSidecar
     case canaryNotAuthorized
+    case fppMetalStartupFailed(String)
 
     public var description: String {
         switch self {
@@ -14,6 +15,8 @@ public enum WorkerRuntimeError: Error, CustomStringConvertible, Sendable {
             return "FPP/ExoMiner pools require the versioned Python science sidecar"
         case .canaryNotAuthorized:
             return "real worker execution requires EXONIT_SWIFT_CANARY=1"
+        case let .fppMetalStartupFailed(reason):
+            return "fpp_backend=metal startup failed: \(reason); CPU fallback is disabled"
         }
     }
 }
@@ -32,6 +35,7 @@ public actor WorkerRuntimeState {
     public func registered(_ id: String) { workerID = id }
     public func begin(tic: String, phase: String) { currentTIC = tic; self.phase = phase }
     public func completed() { currentTIC = nil; phase = nil; starsDone += 1; lastError = nil }
+    public func released() { currentTIC = nil; phase = nil; lastError = nil }
     public func failed(_ message: String) { currentTIC = nil; phase = nil; lastError = message }
     public func heartbeatFailed(_ message: String) { lastError = message }
     public func requestShutdown() { shutdownRequested = true }
@@ -60,6 +64,9 @@ public final class WorkerRuntime: @unchecked Sendable {
     private let pools: Set<String>
     private let canaryAuthorized: Bool
     private let nativeFPPEnabled: Bool
+    private let fppBackendID: String
+    private let fppBackendDevice: String
+    private let fppGate: FPPClaimGate
     private let started = ContinuousClock.now
 
     public init(
@@ -67,7 +74,8 @@ public final class WorkerRuntime: @unchecked Sendable {
         cnnModel: URL? = nil, exominerModel: URL? = nil,
         scienceSidecar: ScienceSidecarConfiguration? = nil,
         canaryAuthorized: Bool = false,
-        session: URLSession = .shared
+        session: URLSession = .shared,
+        fppGPUBackend: (any FPPV3GPUBackend)? = nil
     ) throws {
         let configuredPools = Set(config.taskPools ?? ["primary"])
         let allowed: Set<String> = ["primary", "fpp_backfill", "exominer_backfill"]
@@ -75,8 +83,15 @@ public final class WorkerRuntime: @unchecked Sendable {
         guard unsupported.isEmpty else { throw WorkerRuntimeError.unsupportedTaskPools(unsupported) }
         self.config = config; pools = configuredPools
         self.canaryAuthorized = canaryAuthorized
+        self.fppGate = FPPClaimGate(backend: fppGPUBackend)
         self.nativeFPPEnabled = configuredPools.contains("fpp_backfill")
             && ProcessInfo.processInfo.environment["EXONIT_SWIFT_FPP"] == "1"
+        let fppBackend = try Self.configureFPPBackend(
+            config, nativeFPPEnabled: nativeFPPEnabled,
+            fppPoolConfigured: configuredPools.contains("fpp_backfill")
+        )
+        fppBackendID = fppBackend.id
+        fppBackendDevice = fppBackend.device
         api = WorkerAPIClient(baseURL: config.serverURL, token: config.token, session: session)
         durableOutbox = try DurableOutbox(databaseURL: outboxURL)
         outbox = WorkerResultOutbox(outbox: durableOutbox, api: api)
@@ -88,7 +103,11 @@ public final class WorkerRuntime: @unchecked Sendable {
             maximumConcurrency: config.cpuThreads ?? ProcessInfo.processInfo.activeProcessorCount,
             blsBackend: blsBackend,
             injectionBackend: injectionBackend,
-            gpuEnabled: config.gpuEnabled
+            gpuEnabled: config.gpuEnabled,
+            gapFillDetrendOnly: config.gapFillDetrendOnly,
+            harmonicEpochClass: config.harmonicEpochClass,
+            ffiFallbackOnLoadFail: config.ffiFallbackOnLoadFail,
+            ffiFetchTimeout: config.ffiFetchTimeout
         )
         if configuredPools.contains("fpp_backfill") || configuredPools.contains("exominer_backfill") {
             let nativeFPP = nativeFPPEnabled
@@ -109,6 +128,36 @@ public final class WorkerRuntime: @unchecked Sendable {
         } else {
             backfill = nil
         }
+    }
+
+    private static func configureFPPBackend(
+        _ config: WorkerConfig, nativeFPPEnabled: Bool, fppPoolConfigured: Bool
+    ) throws -> (id: String, device: String) {
+        guard config.fppBackend == .metal else {
+            return (
+                fppPoolConfigured ? (nativeFPPEnabled ? "swift-native" : "python-sidecar") : "disabled",
+                nativeFPPEnabled ? "CPU" : ""
+            )
+        }
+        guard nativeFPPEnabled else {
+            throw WorkerRuntimeError.fppMetalStartupFailed(
+                "requires task_pools containing fpp_backfill and EXONIT_SWIFT_FPP=1"
+            )
+        }
+        #if canImport(Metal)
+        do {
+            let backend = try FPPV3MetalBackend()
+            let fixture = FPPV3CanaryLoader()
+            FPPV3MetalCanary.install(on: backend, fixture: fixture)
+            try backend.canary?(backend)
+            FPPV3LikelihoodRouter.install(backend)
+            return (backend.fppBackendID, backend.backendDevice)
+        } catch {
+            throw WorkerRuntimeError.fppMetalStartupFailed(String(describing: error))
+        }
+        #else
+        throw WorkerRuntimeError.fppMetalStartupFailed("Metal is unavailable in this build")
+        #endif
     }
 
     public func run() async throws {
@@ -182,15 +231,25 @@ public final class WorkerRuntime: @unchecked Sendable {
             return true
         }
         if pools.contains("fpp_backfill"), let backfill,
+           await fppGate.decide() == .claim,
            let task = try await api.getFPPTask(workerID: workerID) {
             await state.begin(tic: task.ticID, phase: "fpp_backfill")
-            let result = try await backfill.processFPP(task, workerID: workerID)
-            try await outbox.enqueueFPP(result, workerID: workerID)
-            try await drainOutboxAfterEnqueue()
-            if result.verdict == "failed" {
-                await state.failed("native FPP processing failed for TIC \(task.ticID)")
-            } else {
-                await state.completed()
+            let outcome = try await backfill.processFPP(task, workerID: workerID)
+            // Note the release reason BEFORE delivering it: the POST in deliver()
+            // can throw, and a GPU failure must still latch the gate down.
+            if case let .release(request) = outcome { await fppGate.noteRelease(reason: request.reason) }
+            switch try await FPPOutcomeDelivery.deliver(
+                outcome, workerID: workerID, api: api, results: outbox
+            ) {
+            case .released:
+                await state.released()
+            case let .enqueued(result):
+                try await drainOutboxAfterEnqueue()
+                if result.verdict == "failed" {
+                    await state.failed("native FPP processing failed for TIC \(task.ticID)")
+                } else {
+                    await state.completed()
+                }
             }
             return true
         }
@@ -239,7 +298,7 @@ public final class WorkerRuntime: @unchecked Sendable {
                 gpu: BLSMetal.deviceName ?? "none",
                 blsBackend: activeBLS,
                 blsGPUInfo: activeMetal ? (BLSMetal.deviceName ?? "Metal") : "",
-                fppBackend: pools.contains("fpp_backfill") ? (nativeFPPEnabled ? "swift-native" : "python-sidecar") : "disabled", cpuCores: cores,
+                fppBackend: fppBackendID, cpuCores: cores,
                 fppCPUCores: config.fppCPUCores ?? cores,
                 hardware: [
                     "runtime": .string("swift-native"),
@@ -249,11 +308,8 @@ public final class WorkerRuntime: @unchecked Sendable {
                     "bls_backend": .string(activeBLS),
                     "injection_backend": .string(injectionBackendName),
                     "coreml_compute_units": .string(config.gpuEnabled ? "all" : "cpuOnly"),
-                    "fpp_backend": .string(
-                        pools.contains("fpp_backfill")
-                            ? (nativeFPPEnabled ? "swift-native" : "python-sidecar")
-                            : "disabled"
-                    ),
+                    "fpp_backend": .string(fppBackendID),
+                    "fpp_backend_device": .string(fppBackendDevice),
                     "exominer_backend": .string(pools.contains("exominer_backfill") ? "python-sidecar" : "disabled")
                 ],
             )
@@ -274,7 +330,8 @@ public final class WorkerRuntime: @unchecked Sendable {
                     currentTIC: currentTIC, phase: await state.phase,
                     starsDone: await state.starsDone,
                     uptimeSeconds: uptime(), pid: getpid(),
-                    lastError: await state.lastError
+                    lastError: await state.lastError,
+                    flagStates: currentHeartbeatFlagStates()
                 ))
                 if command == .reRegister { try await register() }
                 else { await state.apply(command) }
@@ -286,6 +343,37 @@ public final class WorkerRuntime: @unchecked Sendable {
     private func sleep(seconds: Double) async throws {
         try await Task.sleep(for: .seconds(seconds))
     }
+
+    /// Worker-config feature flags published in every heartbeat (python
+    /// `_resolve_flag_states`); keep it small.
+    ///
+    /// `harmonic_epoch_class` is dispatched per task by the server (task value >
+    /// local config > off): python reports the value the last task ACTUALLY ran
+    /// with, never the local config, and omits the key until the first task
+    /// has started (`effectiveHarmonicEpochClass` nil).
+    public static func heartbeatFlagStates(
+        _ config: WorkerConfig, effectiveHarmonicEpochClass: Bool? = nil
+    ) -> [String: JSONValue] {
+        var states: [String: JSONValue] = [
+            "gap_fill_detrend_only": .bool(config.gapFillDetrendOnly),
+            "ffi_fallback_on_load_fail": .bool(config.ffiFallbackOnLoadFail),
+        ]
+        if let effectiveHarmonicEpochClass { states["harmonic_epoch_class"] = .bool(effectiveHarmonicEpochClass) }
+        return states
+    }
+
+    /// Flag states for the next heartbeat (config flags + the last task's effective alias flag).
+    public func currentHeartbeatFlagStates() -> [String: JSONValue] {
+        var states = Self.heartbeatFlagStates(
+            config, effectiveHarmonicEpochClass: processor.lastHarmonicEpochClass
+        )
+        states["fpp_backend"] = .string(fppBackendID)
+        states["fpp_backend_device"] = .string(fppBackendDevice)
+        return states
+    }
+
+    /// The primary processor (exposed for contract tests of the heartbeat wiring).
+    public var primaryProcessor: PrimaryTaskProcessor { processor }
 
     private func uptime() -> Double {
         let duration = started.duration(to: .now)

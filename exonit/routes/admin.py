@@ -1,4 +1,4 @@
-"""System/admin/pipeline-control endpoints (Phase D create_app() split).
+"""System/admin/pipeline-control endpoints (Fase D create_app() split).
 
 Extracted verbatim from exonit.server.create_app() — see
 docs/reviews/2026-07-02-opus48-cleanup-review.md and
@@ -26,6 +26,7 @@ from fastapi.responses import JSONResponse
 from exonit import __version__
 from exonit import progress as progress_model
 from exonit import server as _server
+from exonit import stellar_params as _stellar_params
 from exonit import work_producers, work_streams
 from exonit import worker_recycle
 from exonit.procutil import reap_in_background as _reap_in_background
@@ -81,6 +82,34 @@ def _backlog_query(db, sql, params=()):
         backend.tx_execute(conn, "SET LOCAL jit = off")
         backend.tx_execute(conn, "SET LOCAL random_page_cost = 1.1")
         return backend.tx_query(conn, sql, params)
+
+
+def _fpp_parked_tics(db, tic_ids, chunk_size=5000) -> set:
+    """TICs among ``tic_ids`` whose current-version ``fpp_background`` field is parked
+    (``exonit.fpp_readiness.parked_tics``, the helper the readiness gate uses too).
+
+    Chunked IN lists (PG's 65535-parameter limit). Any failure (no population install on this host,
+    table missing) returns an empty set: the TICs then simply stay in 'actionable', i.e. the drain
+    wait is stricter, never looser.
+    """
+    ids = sorted({str(t) for t in tic_ids})
+    if not ids:
+        return set()
+    try:
+        from exonit.fpp_background import (current_population_version, fetch_population_rows,
+                                           population_family)
+        from exonit.fpp_readiness import parked_tics
+        family = population_family()
+        version = None if family else current_population_version()
+        if not (family or version):
+            return set()
+        rows = fetch_population_rows(db._query, ids, version=version, family=family,
+                                     chunk_size=chunk_size)
+        return parked_tics(rows.values())
+    except Exception:
+        logger.warning("health/work: parked FPP fields not resolved; counting them as actionable",
+                       exc_info=True)
+        return set()
 
 
 def register(app, deps: ServerDeps) -> None:
@@ -205,7 +234,7 @@ def register(app, deps: ServerDeps) -> None:
             # Q8 (perf review 2026-09-26, docs/reviews/2026-09-26-enqueue-
             # path-performance-review.md): the SCOPED (run_id) branch is the
             # orchestrator's phase-exit check (admin.py's own docstring
-            # above, "orchestrator polls every 30 s") — it needs a
+            # above, "poll de l'orquestrador cada 30 s") — it needs a
             # guaranteed-fresh count, so it keeps its own direct JOIN query
             # unchanged. Likewise an UNSCOPED request with nocache=1 (see
             # discovery_orchestrator.py's _health_work_url: run_id can be
@@ -297,7 +326,7 @@ def register(app, deps: ServerDeps) -> None:
             # Loop probing `stars`'s PRIMARY KEY per tic_id, or a Hash Join
             # hashing the tiny CTE result) instead of ever building a hash
             # table over the whole `stars` table. Verified live on
-            # the production PG (2026-09-25): 2621 ms -> 306 ms unscoped,
+            # <postgres-host> (2026-09-25): 2621 ms -> 306 ms unscoped,
             # 1927 ms -> 119 ms scoped (run_id join moved to AFTER the
             # aggregation, on `cand.tic_id` — see post_agg_scope above; moving
             # it there also lets the fpp/nfpp arms keep using their tiny
@@ -361,9 +390,19 @@ def register(app, deps: ServerDeps) -> None:
                 fpp_count_by_tic[r["tic_id"]] += r["n"]
             fpp_total = sum(fpp_count_by_tic.values())
             fpp_cached_tics = _mc.cached_tic_ids(fpp_count_by_tic.keys())
+            # Parked fields (an unresolved R8 population alarm: no Gaia stellar-table producer
+            # exists, so dispatch refuses them for good and writes no value) keep
+            # triceratops_fpp NULL forever. They are not work a worker can pick up, so they are
+            # excluded from 'actionable' (else the orchestrator's drain wait never ends) and
+            # reported on their own as 'parked' -- not folded into 'unrecoverable'.
+            # Same helper as /api/worker/fpp_readiness, read from the current fpp_background rows
+            # (not from the per-candidate SharedState refusal hash, which goes stale on new input).
+            fpp_parked_tics = _fpp_parked_tics(db, [t for t in fpp_count_by_tic if t in fpp_cached_tics])
             fpp_actionable = sum(n for tic, n in fpp_count_by_tic.items()
-                                 if tic in fpp_cached_tics)
-            fpp_unrecoverable = fpp_total - fpp_actionable
+                                 if tic in fpp_cached_tics and tic not in fpp_parked_tics)
+            fpp_parked = sum(n for tic, n in fpp_count_by_tic.items()
+                             if tic in fpp_cached_tics and tic in fpp_parked_tics)
+            fpp_unrecoverable = fpp_total - fpp_actionable - fpp_parked
 
             # ExoMiner backfill: candidates the verdict pipeline considers
             # strong (cnn_score >= 0.7) but ExoMiner never scored. Same partial-index
@@ -460,7 +499,7 @@ def register(app, deps: ServerDeps) -> None:
             #
             # PG measurement (2026-09-25, progress/impl-healthwork-pg-counters.md):
             # this is the only caller of `_lora_workload_counts`
-            # (exonit/server.py). Measured live on the production PG under the
+            # (exonit/server.py). Measured live on <postgres-host> under the
             # actual prod config (EXONIT_LORA_STRONG_ONLY=1, per .env) —
             # lora_stale 826 ms, lora_missing 890 ms. Both already drive off
             # the pre-existing `idx_candidates_verdict_snr (claude_verdict,
@@ -599,7 +638,11 @@ def register(app, deps: ServerDeps) -> None:
             _lora_baseline_pending: int | None = (
                 int(_lora_baseline_raw) if _lora_baseline_raw is not None else None)
 
+            _rel = _stellar_params.relation_status()
+            if not _rel["ok"]:
+                warnings.append("stellar_relation_unavailable")
             payload = {
+                "stellar_relation": _rel,
                 # When these counters were actually read (2026-08-01). The
                 # payload can be served from the SWR cache long after that, and
                 # a consumer which timestamps it "now" draws wrong conclusions:
@@ -620,6 +663,7 @@ def register(app, deps: ServerDeps) -> None:
                 "fpp_backfill": {
                     "actionable": fpp_actionable,
                     "unrecoverable": fpp_unrecoverable,
+                    "parked": fpp_parked,
                     "currently_assigned": _store.hlen(_FPP_ASSIGNMENTS_KEY),
                 },
                 "exominer_backfill": {
@@ -668,7 +712,7 @@ def register(app, deps: ServerDeps) -> None:
                          "kind": scope_kind},
             }
 
-            # Phase 1 (streams): the legacy claims-hash ``currently_assigned``
+            # Fase 1 (streams): the legacy claims-hash ``currently_assigned``
             # above reads a hash the streams path never writes, so with the
             # flag on it always reports 0 inflight and the DLQ — this
             # design's core safety-visibility promise — stays invisible
@@ -1138,7 +1182,7 @@ def register(app, deps: ServerDeps) -> None:
 
     @app.post("/api/start")
     async def api_start(request: Request):
-        # Cross-process guard (PATTERN A3): check the shared pid, not just this
+        # Cross-process guard (PATRÓ A3): check the shared pid, not just this
         # process's Popen handle — /api/start may land on any uvicorn worker.
         if _pipeline_pid_alive() is not None:
             return JSONResponse({"error": "pipeline already running"}, status_code=409)

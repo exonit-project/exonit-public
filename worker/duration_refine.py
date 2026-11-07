@@ -198,4 +198,7 @@ def apply_duration_refine(result, time, flux, logger=None, cadence=None):
     result["duration"] = ref["duration"]
     result["t0"] = ref["t0"]
     result["depth_ppm"] = ref["depth_ppm"]
+    # refine_duration returns the box CENTRE; a result left unrefined (above) keeps the BLS box START.  The worker
+    # passes this marker to FPP as t0_convention (fpp_native section 8b) instead of guessing from the config.
+    result["t0_is_centre"] = True
     return result

@@ -42,6 +42,16 @@ impl std::fmt::Display for FfiViewError {
 
 impl std::error::Error for FfiViewError {}
 
+impl FfiViewError {
+    /// The two "not enough data in the view window" errors. They are exactly
+    /// what Python's `cnn_ffi_views.ViewError` covers (`<5` points in the
+    /// window or span under half the window, and every bin empty); the other
+    /// two variants are caller bugs and stay hard errors, as in Python.
+    pub fn is_sparse(&self) -> bool {
+        matches!(self, FfiViewError::SparseLightCurve | FfiViewError::AllBinsEmpty)
+    }
+}
+
 /// Mirrors Swift's `CNNFFIViews`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CnnFfiViews {
@@ -76,6 +86,27 @@ pub fn make_cnn_views(time: &[f64], flux: &[f64], period: f64, t0: f64, duration
         half_window,
     )?);
     Ok(CnnFfiViews { global, local })
+}
+
+/// `make_cnn_views`, with a sparse view mapped to `Ok(None)` ("CNN not
+/// available") instead of an error. Python `worker/cnn_ffi.py` returns None
+/// for the CNN score on `ViewError` (docs/reviews/2026-10-15-cnn-exact-zero-
+/// scores.md in the exonit repo): the task continues and the candidate gets
+/// no `cnn_score`. Unlike the Python worker (in-task FPP), the native worker
+/// gets FPP only via backfill, whose SQL excludes such rows, so no FPP runs
+/// for it (open item, see `task_processor.rs`'s `ProcessingError` doc).
+pub fn make_cnn_views_if_dense(
+    time: &[f64],
+    flux: &[f64],
+    period: f64,
+    t0: f64,
+    duration: f64,
+) -> Result<Option<CnnFfiViews>, FfiViewError> {
+    match make_cnn_views(time, flux, period, t0, duration) {
+        Ok(views) => Ok(Some(views)),
+        Err(error) if error.is_sparse() => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// Mirrors `FFIViewGenerator.makeAuxiliaryViews(time:flux:period:t0:duration:)`.
@@ -228,4 +259,49 @@ fn normalize(values: &[f64]) -> Vec<f32> {
 /// parity for the odd/even auxiliary split).
 fn round_ties_even(value: f64) -> f64 {
     value.round_ties_even()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn transit_curve() -> (Vec<f64>, Vec<f64>) {
+        let n = 3000;
+        let time: Vec<f64> = (0..n).map(|i| 27.0 * i as f64 / (n - 1) as f64).collect();
+        let flux: Vec<f64> = time
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let dip = if (t - 1.0).rem_euclid(2.0) < 0.05 { 0.02 } else { 0.0 };
+                1.0 - dip + 1e-4 * ((i * 7919 % 1000) as f64 / 1000.0 - 0.5)
+            })
+            .collect();
+        (time, flux)
+    }
+
+    /// Python `cnn_ffi.py`: sparse view -> None, task continues.
+    #[test]
+    fn sparse_view_is_none_not_error() {
+        let time = [0.0, 0.01, 0.02, 0.03];
+        let flux = [1.0; 4];
+        assert_eq!(make_cnn_views(&time, &flux, 2.0, 1.0, 0.1), Err(FfiViewError::SparseLightCurve));
+        assert_eq!(make_cnn_views_if_dense(&time, &flux, 2.0, 1.0, 0.1), Ok(None));
+    }
+
+    #[test]
+    fn dense_view_is_some_and_identical() {
+        let (time, flux) = transit_curve();
+        let direct = make_cnn_views(&time, &flux, 2.0, 1.0, 0.1).expect("dense view");
+        assert_eq!(make_cnn_views_if_dense(&time, &flux, 2.0, 1.0, 0.1), Ok(Some(direct)));
+    }
+
+    /// Caller bugs are not "sparse" and still fail, as in Python.
+    #[test]
+    fn non_sparse_errors_still_propagate() {
+        let (time, flux) = transit_curve();
+        assert_eq!(make_cnn_views_if_dense(&time, &flux, 0.0, 1.0, 0.1), Err(FfiViewError::InvalidEphemeris));
+        assert_eq!(make_cnn_views_if_dense(&time, &flux[..10], 2.0, 1.0, 0.1), Err(FfiViewError::MismatchedSeries));
+        assert!(FfiViewError::AllBinsEmpty.is_sparse());
+        assert!(!FfiViewError::InvalidEphemeris.is_sparse());
+    }
 }

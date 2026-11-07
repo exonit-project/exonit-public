@@ -15,6 +15,7 @@ let package = Package(
         .executable(name: "exonit-preprocess-dump", targets: ["ExoNitPreprocessDump"]),
         .executable(name: "exonit-bls-replay", targets: ["ExoNitBLSReplay"]),
         .executable(name: "exonit-fpp-tests", targets: ["ExoNitFPPTests"]),
+        .executable(name: "fpp_gate_dump", targets: ["ExoNitFPPGateDump"]),
     ],
     targets: [
         .target(
@@ -34,5 +35,6 @@ let package = Package(
         .executableTarget(name: "ExoNitPreprocessDump", dependencies: ["ExoNitCore"]),
         .executableTarget(name: "ExoNitBLSReplay", dependencies: ["ExoNitCore"]),
         .executableTarget(name: "ExoNitFPPTests", dependencies: ["ExoNitCore"]),
+        .executableTarget(name: "ExoNitFPPGateDump", dependencies: ["ExoNitCore"]),
     ]
 )

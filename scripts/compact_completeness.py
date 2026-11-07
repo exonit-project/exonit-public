@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Recurring compaction: ``completeness_staging`` -> bucketed Parquet (MinIO)
-+ exact per-bucket aggregates in PostgreSQL (Phase 4a, Task 3).
++ exact per-bucket aggregates in PostgreSQL (Fase 4a, Task 3).
 
 Task 1 made the completeness write-path (``ExoNitDB.add_completeness_many``,
 ``EXONIT_COMPLETENESS_PG=1``) a pure append into ``completeness_staging`` — no
@@ -145,8 +145,8 @@ MANIFEST_KEY = "buckets/_manifest.json"
 # get a chance to resurface if this ever changes to an IN list.
 _DELETE_IDS_CHUNK = 100_000
 
-# Default number of buckets compacted concurrently (2026-07-17, "fast completeness
-# compaction" spec). Buckets are independent by construction
+# Default number of buckets compacted concurrently (2026-07-17, "compact
+# completeness ràpid" spec). Buckets are independent by construction
 # (partitioned by hash of tic_id) — I/O-bound work (MinIO + PG round trips
 # dominate, not CPU), so a ThreadPoolExecutor genuinely overlaps them despite
 # the GIL. Overridable via EXONIT_COMPACT_WORKERS for ops tuning / tests.

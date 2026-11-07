@@ -43,6 +43,7 @@ raw SQL and never calls ``maybe_enqueue_fpp``.
 from __future__ import annotations
 
 import os
+import re
 
 
 def streams_enabled() -> bool:
@@ -86,6 +87,39 @@ def verdict_eligible(snr, cnn_score, exominer_ffi_score=None) -> bool:
     return cnn_ok or em_ffi_ok
 
 
+def fpp_queue_sql(sql: str) -> str:
+    """Rewrite a legacy FPP-queue query for the cnn-NULL arm (``EXONIT_FPP_CNN_NULL=1``,
+    plan step 6); with the flag off the text is returned UNCHANGED (byte-identical, so the
+    existing partial-index matching is untouched).
+
+    Why: native workers never run FPP in-task, and an FFI sparse-view candidate has
+    ``cnn_score`` NULL and ``exominer_ffi_score`` 0.0, so ``(cnn >= 0.7 OR em_ffi >= 0.5)``
+    excludes it from the backfill for good (reviewed in
+    docs/reviews/2026-10-15-cnn-none-logit-code-review.md, item 1). The OR-gate literal
+    gets ``OR cnn_score IS NULL`` and the INDEXED BY names switch to the ``_n`` indexes
+    built with the same predicate. ``verdict_eligible`` is deliberately NOT widened: such a
+    row still gets no verdict (the classifiers need a CNN score); it only gets an FPP."""
+    from exonit.fpp_model import cnn_null_fpp_enabled
+    if not cnn_null_fpp_enabled():
+        return sql
+    out = sql.replace("(c.cnn_score >= 0.7 OR c.exominer_ffi_score >= 0.5)",
+                      "(c.cnn_score >= 0.7 OR c.exominer_ffi_score >= 0.5 OR c.cnn_score IS NULL)")
+    out = out.replace("(cnn_score >= 0.7 OR exominer_ffi_score >= 0.5)",
+                      "(cnn_score >= 0.7 OR exominer_ffi_score >= 0.5 OR cnn_score IS NULL)")
+    out = re.sub(r"\bidx_cand_(n?fpp)_todo\b(?!_n)", r"idx_cand_\1_todo_n", out)
+    return out
+
+
+def fpp_gate_ok(snr, cnn_score, exominer_ffi_score=None) -> bool:
+    """FPP-queue eligibility: ``verdict_eligible`` plus, only under
+    ``EXONIT_FPP_CNN_NULL=1``, the cnn-NULL arm (``snr >= 10`` and ``cnn_score is None``)."""
+    if verdict_eligible(snr, cnn_score, exominer_ffi_score):
+        return True
+    from exonit.fpp_model import cnn_null_fpp_enabled
+    return (cnn_null_fpp_enabled() and cnn_score is None
+            and snr is not None and snr >= 10.0)
+
+
 def fpp_eligible(row: dict) -> bool:
     """Mirror of the two legacy FPP-scan arms (workers.py:805-824).
 
@@ -95,8 +129,8 @@ def fpp_eligible(row: dict) -> bool:
     """
     if row.get("star_status") != "completed":
         return False
-    if not verdict_eligible(row.get("snr"), row.get("cnn_score"),
-                             row.get("exominer_ffi_score")):
+    if not fpp_gate_ok(row.get("snr"), row.get("cnn_score"),
+                       row.get("exominer_ffi_score")):
         return False
     fpp = row.get("triceratops_fpp")
     nfpp = row.get("nfpp")
@@ -281,16 +315,16 @@ def _derive_fpp(db):
     """
     try:
         arm_a = db._query(
-            """SELECT c.id, c.tic_id, c.snr
+            fpp_queue_sql("""SELECT c.id, c.tic_id, c.snr
                FROM candidates c INDEXED BY idx_cand_fpp_todo
                JOIN stars s ON c.tic_id = s.tic_id
                WHERE c.snr >= 10.0
                  AND (c.cnn_score >= 0.7 OR c.exominer_ffi_score >= 0.5)
                  AND c.triceratops_fpp IS NULL
                  AND s.status = 'completed'
-               ORDER BY c.snr DESC""")
+               ORDER BY c.snr DESC"""))
         arm_b = db._query(
-            """SELECT c.id, c.tic_id, c.snr
+            fpp_queue_sql("""SELECT c.id, c.tic_id, c.snr
                FROM candidates c INDEXED BY idx_cand_nfpp_todo
                JOIN stars s ON c.tic_id = s.tic_id
                WHERE c.snr >= 10.0
@@ -298,14 +332,14 @@ def _derive_fpp(db):
                  AND c.triceratops_fpp >= 0 AND c.triceratops_fpp < 0.5
                  AND c.triceratops_nfpp IS NULL
                  AND s.status = 'completed'
-               ORDER BY c.snr DESC""")
+               ORDER BY c.snr DESC"""))
         rows = arm_a + arm_b
     except Exception:
         # Index missing/renamed on this DB — fall back to the broad OR form
         # (identical result set, only slower). Mirrors workers.py's own
         # fallback for the same reason.
         rows = db._query(
-            """SELECT c.id, c.tic_id, c.snr
+            fpp_queue_sql("""SELECT c.id, c.tic_id, c.snr
                FROM candidates c
                JOIN stars s ON c.tic_id = s.tic_id
                WHERE c.snr >= 10.0
@@ -318,7 +352,7 @@ def _derive_fpp(db):
                      AND c.triceratops_nfpp IS NULL
                    )
                  )
-                 AND s.status = 'completed'""")
+                 AND s.status = 'completed'"""))
     rows.sort(key=lambda r: r["snr"], reverse=True)
     return [(str(r["id"]), {"candidate_id": r["id"], "tic_id": r["tic_id"]})
             for r in rows]

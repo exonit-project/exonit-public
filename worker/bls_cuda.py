@@ -993,7 +993,7 @@ def _log_size_route_once(n_pts, threshold):
         "bls_gpu_batch: N=%d points exceeds the f32 CPU-fold threshold "
         "(%d) -- routing to the f64 GPU-fold kernel for this and every "
         "subsequent oversized call in this process (measured crossover, "
-        "2026-07-12 RTX 5060 Ti bench: past this point the f64 kernel's "
+        "2026-07-12 <host> bench: past this point the f64 kernel's "
         "on-GPU fold beats the f32 kernel's CPU fold). Override with env "
         "EXONIT_BLS_CUDA_F32_MAX_PTS.", n_pts, threshold)
 

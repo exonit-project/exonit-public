@@ -12,7 +12,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import ipaddress
 import json
 import os
 import sqlite3
@@ -355,11 +354,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="'id' (default, oldest first) or 'strong' (strong-tier gate "
                          "snr>=10 & cnn>=0.7 first, then id) — use with --limit for "
                          "manual backfills of the historic backlog.")
-    ap.add_argument("--server-url",
-                    default=os.environ.get("EXONIT_SERVER_URL") or "http://127.0.0.1:8400",
+    ap.add_argument("--server-url", default="http://<server-ip>:8400",
                     help="Base URL of the ExoNit server (used for the "
-                         "batch-write endpoint). Defaults to $EXONIT_SERVER_URL, "
-                         "else the local server (this script runs on the server host).")
+                         "batch-write endpoint).")
     ap.add_argument("--batch-size", type=int, default=25,
                     help="Number of results to accumulate before flushing to "
                          "the server via POST /api/candidate/update_analysis.")
@@ -374,22 +371,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
 #: a pytest run reached this script for real (via an unmocked
 #: discovery_orchestrator.step_lora -> lora_macs_driver.py ->
 #: generate_missing_explanations.py chain) with the default --db, and wrote
-#: 1,650 real LoRA explanations to the production Postgres (a private-LAN
-#: address). pytest sets PYTEST_CURRENT_TEST in os.environ for the
+#: 1,650 real LoRA explanations to production Postgres (<host>,
+#: <postgres-host>). pytest sets PYTEST_CURRENT_TEST in os.environ for the
 #: duration of every test (subprocesses inherit it), so this is a reliable
 #: signal we are running under pytest.
 #:
 #: Review follow-up: the --db check alone keys off the wrong signal for the
 #: GENERAL case — the actual dangerous mutation this script performs is the
 #: POST {--server-url}/api/candidate/update_analysis call, and --server-url
-#: defaults to the real ExoNit server (the local one, or $EXONIT_SERVER_URL)
+#: defaults to the real production ExoNit server (http://<server-ip>:8400)
 #: independently of --db. A hypothetical future caller with a harmless local
 #: --db (e.g. an empty tmp SQLite file) but the default --server-url would
 #: sail past a --db-only check and still POST any matching rows to prod. So
-#: this guard now fires on EITHER signal: --db being any PostgreSQL DSN whose
-#: database name does not end in `_test`, OR --server-url resolving to a
-#: private-LAN address or to the local production port (8400) — a test's own
-#: local HTTP server/TestClient binds a random port, never 8400.
+#: this guard now fires on EITHER signal: --db resolving to prod <host>
+#: Postgres, OR --server-url resolving to a real ExoNit-LAN host (any
+#: <lan-subnet>.x address — not localhost/127.0.0.1, which is what a test's
+#: own local HTTP server/TestClient would use).
 #:
 #: Every test in this repo's own suite (tests/test_generate_missing_explanations.py)
 #: already points --db at a throwaway tmp_path SQLite file and --server-url
@@ -398,41 +395,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
 #: server end-to-end must point both at non-prod targets, or set
 #: EXONIT_GEN_EXPLANATIONS_ALLOW_UNDER_PYTEST=1 explicitly.
 GEN_EXPLANATIONS_PYTEST_GUARD_ENV = "EXONIT_GEN_EXPLANATIONS_ALLOW_UNDER_PYTEST"
-
-
-#: The production server's port. A test's own local server uses a random port, so
-#: loopback + 8400 is the real server (this script usually runs on the server host).
-PROD_SERVER_PORT = 8400
+PROD_PG_HOST = "<postgres-host>"
+#: The ExoNit LAN this script's --db/--server-url production defaults live
+#: on (<lan-ip>/24 — <host>=.76, <host>=.56, the Mac fleet, etc.).
+#: Any URL whose host falls in this range is treated as "real infrastructure"
+#: by the --server-url guard below, regardless of which specific host.
+PROD_LAN_PREFIX = os.environ.get("EXONIT_PROD_LAN_PREFIX", "<lan-prefix>")
 
 
 def _is_prod_db_dsn(db: str) -> bool:
-    """True for ANY PostgreSQL DSN whose dbname does NOT end in `_test` — e.g.
-    ``postgresql://exonit@10.0.0.5:5432/exonit`` or ``postgresql://exonit@localhost/exonit``
-    (a local PostgreSQL is the real database on a single-host install). A plain SQLite
-    path is never considered "prod" by this check."""
-    if not db.startswith(("postgresql://", "postgres://")):
+    """True for the production <host> Postgres DSN whose dbname does NOT
+    end in `_test` — e.g. ``postgresql://exonit@<postgres-host>:5432/exonit``.
+    A DSN for any other host (including a plain SQLite path) is never
+    considered "prod" by this check."""
+    if PROD_PG_HOST not in db:
         return False
     dbname = db.rsplit("/", 1)[-1].split("?", 1)[0]
     return not dbname.endswith("_test")
 
 
 def _is_prod_server_url(server_url: str) -> bool:
-    """True if *server_url* is real infrastructure: a private-LAN address (10/8, 172.16/12,
-    192.168/16), or loopback on the production port 8400. Loopback on any other port
-    (what a test's own local HTTP server or FastAPI TestClient binds to) and
-    hostnames are never considered prod."""
+    """True if *server_url*'s host is a real ExoNit-LAN address (any
+    <lan-subnet>.x — the production server's own default is .76, but any host
+    on that LAN is real infrastructure, not a test fixture). ``localhost``/
+    ``127.0.0.1``/``::1``/``0.0.0.0`` (what a test's own local HTTP server or
+    FastAPI TestClient binds to) are never considered prod."""
     try:
-        parts = urlsplit(server_url)
-        host, port = parts.hostname or "", parts.port
+        host = urlsplit(server_url).hostname or ""
     except ValueError:
         return False
-    if host in ("localhost", "127.0.0.1", "::1"):
-        return port == PROD_SERVER_PORT
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
+    if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
         return False
-    return ip.is_private and not ip.is_loopback and not ip.is_unspecified
+    return host.startswith(PROD_LAN_PREFIX)
 
 
 def main() -> int:
@@ -444,9 +438,9 @@ def main() -> int:
             and os.environ.get(GEN_EXPLANATIONS_PYTEST_GUARD_ENV) != "1"):
         reasons = []
         if prod_db:
-            reasons.append(f"--db points at a LAN PostgreSQL server ({args.db!r})")
+            reasons.append(f"--db points at production <host> Postgres ({args.db!r})")
         if prod_server:
-            reasons.append(f"--server-url points at a private-LAN host ({args.server_url!r})")
+            reasons.append(f"--server-url points at a real ExoNit-LAN host ({args.server_url!r})")
         print(
             f"REFUSED: generate_missing_explanations.py detected "
             f"PYTEST_CURRENT_TEST in the environment (running under pytest) "
@@ -465,8 +459,7 @@ def main() -> int:
     # --endpoints-json was given explicitly (see the mutually-exclusive
     # group above).
     if args.endpoints_json is None and args.explainer_url is None:
-        args.explainer_url = (os.environ.get("EXONIT_EXPLAINER_URL")
-                              or "http://127.0.0.1:8500/api/explain")
+        args.explainer_url = "http://<postgres-host>:8500/api/explain"
 
     # use_pool selects the new exonit.explainer_pool.EndpointPool code path.
     # A single --explainer-url + --workers N with no --max-seconds keeps the

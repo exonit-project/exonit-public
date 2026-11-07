@@ -1,16 +1,16 @@
 """Local-AI triage client (phase 1 — shadow mode).
 
-`TriageClient.choose(ctx)` sends the `ErrorContext` to a local OpenAI-compatible
-server (e.g. `qwen-llm.service` on <host>) and expects a JSON `PlaybookChoice` back.
-The client **never raises exceptions**: any failure (HTTP/network error, timeout,
-invalid JSON, incomplete schema, playbook that fails `playbooks.validate()`, or
-confidence below the threshold of rule 5 of annex A) is turned into a
-`pause_and_alert` with `source="fallback"` (or `source="llm"` when the AI chose
-`pause_and_alert` itself with a valid answer).
+`TriageClient.choose(ctx)` sends the `ErrorContext` to a local
+OpenAI-compatible server (e.g. `qwen-llm.service` on <host>) and expects a
+`PlaybookChoice` as JSON in return. The client **never raises**: any failure
+(HTTP/network error, timeout, invalid JSON, incomplete schema, a playbook that
+fails `playbooks.validate()`, or confidence below the rule-5 threshold of
+annex A) is converted into a `pause_and_alert` with `source="fallback"` (or
+`source="llm"` when the AI itself chose `pause_and_alert` with a valid
+response).
 
-The system prompt is `autonomy/prompts/triage_system.txt`, copied from
-annex A of `docs/superpowers/specs/2026-08-08-autonomous-runs-design.md`
-(translated to English for the public export).
+The system prompt is `autonomy/prompts/triage_system.txt`, copied verbatim
+from annex A of `docs/superpowers/specs/2026-08-08-autonomous-runs-design.md`.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ def _fallback(reason: str, detail: str) -> PlaybookChoice:
 
 
 class TriageClient:
-    """HTTP client (stdlib `urllib`, no new dependencies) for the local AI triage."""
+    """HTTP client (stdlib `urllib`, no new dependencies) for the local-AI triage."""
 
     def __init__(self, base_url: str, model: str, timeout_s: int = 120):
         self.base_url = base_url.rstrip("/")
@@ -82,7 +82,7 @@ class TriageClient:
         try:
             content = json.loads(raw)["choices"][0]["message"]["content"]
         except Exception as exc:  # noqa: BLE001 - response with an unexpected shape
-            return _fallback("HTTP response with an unexpected shape", repr(exc))
+            return _fallback("HTTP response with unexpected shape", repr(exc))
 
         try:
             start = content.index("{")
@@ -110,7 +110,7 @@ class TriageClient:
 
         try:
             reason = validate(choice)
-        except Exception as exc:  # noqa: BLE001 - plausible schema but malformed (e.g. params not a dict, playbook not a string)
+        except Exception as exc:  # noqa: BLE001 - schema plausible but malformed (e.g. params not a dict, playbook not a string)
             return _fallback("validate() failed on the AI response", repr(exc))
         if reason is not None:
             return _fallback(f"invalid playbook: {reason}", reason)
@@ -144,15 +144,15 @@ def spawn_and_choose(
 ) -> PlaybookChoice:
     """Start `cfg.server_bin` on demand, make the call with `TriageClient`,
     and ALWAYS kill the process (`finally`) — the triage server is never
-    left alive between remediations. **Never raises**: any failure (AI disabled,
-    empty `model_path`, missing binary, startup timeout) falls back to
-    `pause_and_alert` with `source="fallback"`, same as `TriageClient`.
+    left alive between remediations. **Never raises**: any failure (AI
+    disabled, empty `model_path`, missing binary, startup timeout) falls back
+    to `pause_and_alert` with `source="fallback"`, just like `TriageClient`.
 
     `popen`/`sleep_fn`/`monotonic` are injectable for tests only —
     in production they are always `subprocess.Popen`/`time.sleep`/`time.monotonic`.
     """
     if not cfg.enabled:
-        return _fallback("local AI triage disabled", "TriageLLMConfig.enabled=False")
+        return _fallback("local-AI triage disabled", "TriageLLMConfig.enabled=False")
     if not cfg.model_path:
         return _fallback("empty model_path", "TriageLLMConfig.model_path not configured")
 
@@ -165,7 +165,7 @@ def spawn_and_choose(
     try:
         try:
             proc = popen(cmd, start_new_session=True)
-        except Exception as exc:  # noqa: BLE001 - missing bin, permissions, etc.
+        except Exception as exc:  # noqa: BLE001 - missing binary, permissions, etc.
             return _fallback(f"could not start {cfg.server_bin}", repr(exc))
 
         base_url = f"http://127.0.0.1:{cfg.port}"

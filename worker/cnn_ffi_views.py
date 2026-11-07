@@ -1,7 +1,7 @@
 """Phase-fold + median-filter views for FFI CNN training.
 
-Direct port of worker/cnn_astronet.py:_phase_fold_sort and _median_filter,
-extracted into a module shared by scripts and tests.
+Port directe de worker/cnn_astronet.py:_phase_fold_sort i _median_filter,
+extret a un mòdul compartit per scripts i tests.
 """
 from __future__ import annotations
 

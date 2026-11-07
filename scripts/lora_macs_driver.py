@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LoRA explanation step driver — the 5 Mac mini M4 fleet (Phase, 2026-09-26).
+"""LoRA explanation step driver — the 5 Mac mini M4 fleet (Fase, 2026-09-26).
 
 Runs on <host> with ``.venv-server`` (same host/venv as the generator and the
 old ``ops/lora_via_llamacpp.sh``/``ops/lora_via_gpuq.sh`` — see
@@ -166,18 +166,18 @@ def count_exonit_worker_processes(ps_output: str) -> int:
 
 #: Design §2.2's host-specific safeguard, generalized to any host
 #: (config-driven per host in ops/lora_macs.json, defaults applied
-#: fleet-wide): ".60 in use by the operator" — a resident model in their own oMLX app,
+#: fleet-wide): ".60 en ús per the owner" — a resident model in his own oMLX app,
 #: or any other stray mlx_lm/llama.cpp process NOT started by us, competes
 #: for the same RAM/Metal the RAM rule above just cleared the host for. The
 #: generic reclaimable-RAM rule (apply_ram_rule) may often catch this
 #: indirectly (a resident model eats into free/inactive/purgeable pages),
 #: but the design explicitly calls this an independent check because that
-#: coverage is unknown ("unknown whether oMLX keeps the model resident when
+#: coverage is unknown ("desconegut si oMLX manté el model resident en
 #: idle") — hence a second, direct guard rather than relying on the first.
 DEFAULT_FOREIGN_LLM_PROCESS_PATTERNS = [
-    r"omlx",              # the operator's oMLX.app (personal, seen on .60)
+    r"omlx",              # the owner's oMLX.app (personal, seen on .60)
     r"mlx[_-]lm",         # any mlx_lm.server/CLI NOT under our own remote_dir
-    r"llama[-_.]?server", # llama.cpp server (Phase 2 override artifact, or the operator's own)
+    r"llama[-_.]?server", # llama.cpp server (Fase 2 override artifact, or the owner's own)
     r"llama\.cpp",
 ]
 #: Fleet-wide default RSS ceiling (GB) for a match above — design's ".60 ...
@@ -194,7 +194,7 @@ def find_foreign_llm_processes(ps_output: str, patterns: list[str],
     command line) and return every ``(command, rss_gb)`` pair that:
 
     - matches at least one of *patterns* (regex, case-insensitive) — e.g.
-      the operator's oMLX app, a stray ``mlx_lm.server``/CLI, a llama.cpp server;
+      the owner's oMLX app, a stray ``mlx_lm.server``/CLI, a llama.cpp server;
     - is **not one of our own processes**: *own_dir* (the host's
       ``~/exonit-lora`` ``remote_dir``) does not appear in the command line.
       ``cleanup_orphans()`` already kills any leftover process of ours
@@ -359,7 +359,7 @@ class FleetConfig:
     hosts: list[HostConfig]
     port: int = 8500
     mlx_port: int = 8503
-    remote_dir: str = "exonit-lora"  # relative to the remote $HOME
+    remote_dir: str = "~/exonit-lora"
     min_hosts: int = 1
     min_free_disk_gb: float = 10.0
     budget_hours: float = 14.0
@@ -395,7 +395,7 @@ class FleetConfig:
             hosts=hosts,
             port=int(raw.get("port", 8500)),
             mlx_port=int(raw.get("mlx_port", 8503)),
-            remote_dir=raw.get("remote_dir", "exonit-lora"),
+            remote_dir=raw.get("remote_dir", "~/exonit-lora"),
             min_hosts=int(raw.get("min_hosts", 1)),
             min_free_disk_gb=float(raw.get("min_free_disk_gb", 10.0)),
             budget_hours=float(raw.get("budget_hours", 14.0)),
@@ -597,7 +597,7 @@ class Driver:
             self._job(f"host={host.name} EXCLUDED: {res.excluded_reason}")
             return res
 
-        # 4b) Foreign LLM process guard (design §2.2's ".60 in use by the operator"
+        # 4b) Foreign LLM process guard (design §2.2's ".60 en ús per the owner"
         # check, generalized/config-driven to every host — see
         # find_foreign_llm_processes). A resident oMLX/mlx_lm/llama.cpp
         # process not started by us competes for the same RAM/Metal the RAM
@@ -704,11 +704,11 @@ class Driver:
         )
         shim_cmd = (
             f"cd {remote_dir} && "
-            f"PYTHONPATH=$PWD/shim "
+            f"PYTHONPATH={remote_dir}/shim "
             f"EXPLAINER_LLAMA_URL=http://127.0.0.1:{self.config.mlx_port} "
             f"EXPLAINER_MAX_TOKENS=640 EXPLAINER_REQUEST_TIMEOUT=150 "
             f"EXPLAINER_BACKEND=mlx "
-            f"nohup .venv/bin/uvicorn --app-dir $PWD/shim "
+            f"nohup .venv/bin/uvicorn --app-dir {remote_dir}/shim "
             f"explainer_service_llamacpp:app --host 0.0.0.0 --port {self.config.port} "
             f"< /dev/null > logs/shim.log 2>&1 & "
             f"echo $! > run/shim.pid"
@@ -881,8 +881,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="start+readiness+N no-DB-write requests+teardown, no generator")
     p.add_argument("--smoke-n", type=int, default=10)
     p.add_argument("--db", default=os.environ.get(
-        "EXONIT_LORA_DB", os.environ.get(
-            "EXONIT_DATABASE_URL", "postgresql://exonit@localhost:5432/exonit")))
+        "EXONIT_LORA_DB", "postgresql://exonit@<postgres-host>:5432/exonit"))
     p.add_argument("--gen-timeout", type=float, default=170.0,
                    help="--timeout passed to the generator (per-request deadline)")
     return p

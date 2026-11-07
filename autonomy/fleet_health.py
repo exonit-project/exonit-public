@@ -1,18 +1,17 @@
-"""Fleet health probe over read-only SSH (phase 1 — shadow mode).
+"""Read-only SSH fleet health probe (phase 1 — shadow mode).
 
-`collect()` walks `FLEET_WORKERS` (playbooks.py) and runs, per host, a
-single READ command (disk + RAM + temperature if available) via SSH
+`collect()` walks `FLEET_WORKERS` (playbooks.py) and runs, per host, a single
+READ command (disk + RAM + temperature if available) via SSH
 (`BatchMode=yes`, `ConnectTimeout=10`) or locally for `worker-default`.
-No remote writes, no kill, no restart — read only. `evaluate()`
-compares the results against the `Thresholds` from config.py and produces
-`Advisory` items (some with a suggested playbook from the closed catalog in
+No remote writes, no kill, no restart — read only. `evaluate()` compares the
+results against the `Thresholds` from config.py and produces `Advisory`
+objects (some with a suggested playbook from the closed catalog in
 playbooks.py, others informational only in v1).
 
 The parsers (`parse_df_kb`, `parse_free_m`, `parse_vm_stat`, `parse_wmic`,
 `parse_sensors`) are pure functions over text — tested with real captured
-outputs, with no SSH in the tests. The only real SSH/local execution
-happens in `_run_ssh`, injectable into `probe_host`/`collect` via the
-`runner` parameter.
+outputs, with no SSH in the tests. The only real SSH/local execution is in
+`_run_ssh`, injectable into `probe_host`/`collect` via the `runner` parameter.
 
 CLI: `python -m autonomy.fleet_health [--json]` — collect+evaluate, writes
 `data/autonomy/fleet_health.json` and prints a short table.
@@ -30,10 +29,15 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from autonomy.config import REPO_ROOT, Thresholds, load_config
-from autonomy.playbooks import FLEET_PLATFORMS, FLEET_WORKERS, is_mac_host
+from autonomy.playbooks import FLEET_WORKERS
 from autonomy.types import Advisory, HostHealth
 
 _LOG = logging.getLogger("autonomy.fleet_health")
+
+# Platform per worker (fixed map — source of truth: CLAUDE.md fleet).
+_PLATFORM: dict[str, str] = {
+    "worker-default": "linux",
+}
 
 # READ commands per platform (no writes, no kill/restart).
 _COMMANDS: dict[str, str] = {
@@ -79,8 +83,8 @@ def parse_free_m(text: str) -> Optional[float]:
 def parse_vm_stat(text: str, memsize: int) -> Optional[float]:
     """Parse `vm_stat` (mac). ram_avail_gb = (Pages free + Pages inactive) x pagesize.
 
-    `memsize` (bytes, from `sysctl -n hw.memsize`) is only used as a
-    safety cap (we never return more available RAM than the total).
+    `memsize` (bytes, from `sysctl -n hw.memsize`) is used only as a safety
+    cap (we never return more available RAM than the total).
     """
     free_m = _VM_STAT_FREE_RE.search(text)
     inactive_m = _VM_STAT_INACTIVE_RE.search(text)
@@ -118,7 +122,7 @@ def parse_wmic(text: str) -> tuple[Optional[float], Optional[float], Optional[fl
 
 
 def parse_sensors(text: str) -> Optional[float]:
-    """First temperature match (`+NN.N°C`) in `sensors` output (linux). None if there is none."""
+    """First temperature match (`+NN.N°C`) in the `sensors` output (linux). None if there is none."""
     m = _SENSORS_TEMP_RE.search(text)
     if not m:
         return None
@@ -126,7 +130,7 @@ def parse_sensors(text: str) -> Optional[float]:
 
 
 def _parse_memsize(text: str) -> int:
-    """Extract `sysctl -n hw.memsize` (a digits-only line) from the combined mac text."""
+    """Extract `sysctl -n hw.memsize` (a line with only digits) from the combined mac text."""
     matches = _STANDALONE_NUMBER_RE.findall(text)
     return int(matches[-1]) if matches else 0
 
@@ -151,15 +155,15 @@ def probe_host(
 ) -> HostHealth:
     """Probe a host: run its platform's command and parse the result.
 
-    Never raises — any failure (timeout, SSH error, parse) is translated to
+    Never raises — any failure (timeout, SSH error, parse) is translated into
     `HostHealth(reachable=False, error=...)`.
     """
-    platform = FLEET_PLATFORMS.get(worker_name, "linux")
+    platform = _PLATFORM.get(worker_name, "linux")
     cmd = _COMMANDS[platform]
 
     try:
         text = runner(target, cmd)
-    except Exception as exc:  # noqa: BLE001 - any probe failure is contained here
+    except Exception as exc:  # noqa: BLE001 - any probe failure is counted here
         return HostHealth(worker_name=worker_name, host=target, reachable=False, error=str(exc))
 
     try:
@@ -176,7 +180,7 @@ def probe_host(
             disk_free_gb, pct_used, ram_avail_gb = parse_wmic(text)
         else:
             disk_free_gb = pct_used = ram_avail_gb = None
-    except Exception as exc:  # noqa: BLE001 - defensive parse, never propagate an exception upwards
+    except Exception as exc:  # noqa: BLE001 - defensive parse, never propagate an exception upward
         return HostHealth(worker_name=worker_name, host=target, reachable=False, error=f"parse error: {exc!r}")
 
     return HostHealth(
@@ -197,17 +201,17 @@ def collect(runner: Callable[[str, str], str] = _run_ssh) -> list[HostHealth]:
     for worker_name, target in FLEET_WORKERS.items():
         try:
             results.append(probe_host(worker_name, target, runner=runner))
-        except Exception as exc:  # noqa: BLE001 - probe_host should already contain this, double safety net
+        except Exception as exc:  # noqa: BLE001 - probe_host should already contain failures; double safety net
             results.append(HostHealth(worker_name=worker_name, host=target, reachable=False, error=str(exc)))
     return results
 
 
 def _is_mac_host(worker_name: str) -> bool:
-    return is_mac_host(worker_name)
+    return worker_name.startswith("worker-<host>") or worker_name == "worker-<host>"
 
 
 def evaluate(healths: list[HostHealth], th: Thresholds) -> list[Advisory]:
-    """Generate `Advisory` items from the `HostHealth` entries outside thresholds (`Thresholds`)."""
+    """Generate `Advisory` objects from the `HostHealth` entries outside thresholds (`Thresholds`)."""
     advisories: list[Advisory] = []
 
     for h in healths:
@@ -292,7 +296,7 @@ def _print_table(healths: list[HostHealth], advisories: list[Advisory]) -> None:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Fleet health probe over read-only SSH.")
+    parser = argparse.ArgumentParser(description="Read-only SSH fleet health probe.")
     parser.add_argument("--json", action="store_true", help="print the full JSON to stdout")
     parser.add_argument(
         "--config",

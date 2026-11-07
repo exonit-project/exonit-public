@@ -455,7 +455,7 @@ def main() -> None:
     )
     # PG connection args (overridden by EXONIT_DATABASE_URL env var)
     pg = parser.add_argument_group("PostgreSQL connection (ignored if EXONIT_DATABASE_URL is set)")
-    pg.add_argument("--pg-host",     default="localhost")
+    pg.add_argument("--pg-host",     default="<postgres-host>")
     pg.add_argument("--pg-port",     default="5432")
     pg.add_argument("--pg-user",     default="exonit")
     pg.add_argument("--pg-dbname",   default="exonit")

@@ -1,7 +1,7 @@
 """Per-candidate FFI/SPOC routing signal for the verdict classifier dispatcher.
 
 docs/superpowers/specs/2026-09-19-verdict-v3-tfopwg-design.md §5 ("Scope of
-data in production"): v3_tfopwg is trained exclusively on TGLC (FFI) rows and
+production data"): v3_tfopwg is trained exclusively on TGLC (FFI) rows and
 must never score a SPOC candidate (train/serve distribution shift — round 2
 review item 3). The dispatcher (``exonit/verdict_classifier.py``'s
 ``predict_verdict``) picks one model per process today via

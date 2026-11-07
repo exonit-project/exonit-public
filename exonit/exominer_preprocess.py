@@ -16,8 +16,8 @@ rerun.
 Typical usage::
 
     pre = ExoMinerPreprocessor(
-        nfs_records_dir="<tess-cache>/exominer_records",
-        nfs_tce_table_dir="<tess-cache>/exominer_tce_tables",
+        nfs_records_dir="/data/tess_cache/exominer_records",
+        nfs_tce_table_dir="/data/tess_cache/exominer_tce_tables",
     )
     result = pre.preprocess_tic("382437043")
     # → TFRecord at result.tfrecord_path, TCE table at result.tce_table_path

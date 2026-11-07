@@ -20,6 +20,12 @@ pub struct StarRec {
     pub tmag: f64,
     pub plx: f64,
     pub is_trilegal: bool,
+    /// Stellar-mass fallback provenance of the served record (`/api/nearby`, task 33 item 3): the string
+    /// `mass_source` (e.g. `teff_relation_tic8fit`), Python truthiness of `giant_host`, and the string hint
+    /// `mass_unavailable_reason`. A non-string value is `None` (Python compares it to strings and it never matches).
+    pub mass_source: Option<String>,
+    pub giant_host: bool,
+    pub mass_unavailable_reason: Option<String>,
     // filled by compute_flux_ratios
     pub weighted_flux: f64,
     pub fluxratio: f64,
@@ -48,6 +54,18 @@ fn id_string(v: &Value) -> String {
     }
 }
 
+/// Python `bool(value)` of a JSON value.
+pub fn python_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64().is_some_and(|x| x != 0.0),
+        Value::String(value) => !value.is_empty(),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
+    }
+}
+
 /// Parse the raw `/api/nearby` JSON and apply `_query_tic_stars`
 /// post-processing for `tic_id`.
 pub fn parse_nearby(doc: &Value, tic_id: &str) -> Option<NearbyResponse> {
@@ -65,6 +83,12 @@ pub fn parse_nearby(doc: &Value, tic_id: &str) -> Option<NearbyResponse> {
             tmag: s.get("Tmag").map(num_or_nan).unwrap_or(f64::NAN),
             plx: s.get("plx").map(num_or_nan).unwrap_or(f64::NAN),
             is_trilegal: false,
+            mass_source: s.get("mass_source").and_then(Value::as_str).map(str::to_string),
+            giant_host: s.get("giant_host").is_some_and(python_truthy),
+            mass_unavailable_reason: s
+                .get("mass_unavailable_reason")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             weighted_flux: f64::NAN,
             fluxratio: f64::NAN,
             tdepth: f64::NAN,
@@ -140,6 +164,9 @@ pub fn load_trilegal(csv: &str, target_ra: f64, target_dec: f64, target_tmag: f6
             tmag,
             plx: f64::NAN,
             is_trilegal: true,
+            mass_source: None,
+            giant_host: false,
+            mass_unavailable_reason: None,
             weighted_flux: f64::NAN,
             fluxratio: f64::NAN,
             tdepth: f64::NAN,

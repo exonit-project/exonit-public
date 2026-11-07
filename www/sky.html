@@ -168,8 +168,8 @@ function readTokens() {
 const TOK = readTokens();
 // Verdict -> color, shared by the 3D layer materials, the pick panel's dot
 // and the fallback table's tags. Only 3 hues used across the whole scene
-// (mute/neutral, accent/cyan, ok/green) — spec §7's "NEVER more than 3
-// simultaneous color categories in the 3D view (all-pairs)".
+// (mute/neutral, accent/cyan, ok/green) — spec §7's "MAI més de 3
+// categories de color simultànies al 3D (all-pairs)".
 const RESULT_COLOR = { none: TOK.ink2, candidate: TOK.accent, strong: TOK.ok, active: TOK.accent };
 
 // rgba(r, g, b[, a]) or #rrggbb -> { hex, alpha }. --line-strong is an
@@ -242,8 +242,8 @@ function raDecToXyz(raDeg, decDeg, radius) {
 //   inventing an approximate camera-boundary shape would be exactly the
 //   kind of drift CLAUDE.md's "no invent" rule forbids. Spec §7's hairline
 //   LineSegments requirement is instead met by the equatorial graticule,
-//   which the spec explicitly allows ("subtle optional equatorial grid")
-//   and which is real, derivable geometry (RA/Dec lines), not
+//   which the spec explicitly allows ("graella equatorial subtil
+//   opcional") and which is real, derivable geometry (RA/Dec lines), not
 //   invented sector shapes.
 // ════════════════════════════════════════════════════════════════════════
 
@@ -251,7 +251,7 @@ const SPHERE_R = 42;
 const ORBIT_MIN = 54, ORBIT_MAX = 230, ORBIT_DEFAULT = 108;
 const PITCH_LIMIT = 85 * Math.PI / 180;
 const DRAG_SENS = 0.006;
-const DAMPING = 0.90; // per-frame angular-velocity decay after release (§7.3 "soft inertia")
+const DAMPING = 0.90; // per-frame angular-velocity decay after release (§7.3 "inèrcia suau")
 const FRAME_INTERVAL_MS = 1000 / 30; // §0.3: ~30fps throttle
 const ACTIVE_PULSE_PERIOD_S = 1.6;
 
@@ -418,7 +418,7 @@ function renderOnce() {
 }
 // Called after any camera/data/selection change so reduced-motion mode
 // (which never runs the rAF loop) still reflects the new state — spec §0.3
-// point 6: "manual orbit keeps working: re-render on input").
+// point 6: "orbit manual segueix funcionant: re-renderitza en input".
 function requestRender() {
   if (usingFallback || !renderer) return;
   if (reducedMotion) renderOnce();
@@ -726,7 +726,7 @@ function enableFallback(reason) {
 }
 
 // ── Data-driven layer rebuilds (called on data load, never per animation
-// frame — spec §0.3 point 6: "no geometry filters on re-render") ──────
+// frame — spec §0.3 point 6: "no filtris geometries en re-render") ──────
 function rebuildResultLayers() {
   const noneRecs = [], candRecs = [], strongRecs = [];
   for (const s of completed.values()) {

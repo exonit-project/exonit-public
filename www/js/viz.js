@@ -27,7 +27,7 @@ export const SERIES = [
 ];
 
 // ── 2.7 Sequential "ember" ramp — magnitude encoding (completeness,
-//    densities). Black = least active, vivid red = most active (the operator,
+//    densities). Black = least active, vivid red = most active (the owner,
 //    2026-08-17). 8 monotone-L steps, OKLCH hue 27→32. The near-black low
 //    end sits below the generic 2:1 contrast floor BY DESIGN (inactive
 //    zones recede); relief: hairline on every heat cell, per-cell
@@ -100,8 +100,8 @@ export function heatLegend(container, { scale = 'sqrt' } = {}) {
 }
 
 // ── Shared tooltip — one div.viz-tip, reused across every call site instead
-//    of one element per hoverable target (spec §6: "one global div.viz-tip
-//    reused"). Styled in exonit.css.
+//    of one element per hoverable target (spec §6: "un únic div.viz-tip
+//    global reutilitzat"). Styled in exonit.css.
 let _tipEl = null;
 function getTip() {
   if (_tipEl) return _tipEl;

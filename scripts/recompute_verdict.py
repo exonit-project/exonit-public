@@ -87,7 +87,7 @@ logging.basicConfig(
 logger = logging.getLogger("recompute_verdict")
 
 DEFAULT_DB_URL = os.environ.get(
-    "EXONIT_DATABASE_URL", "postgresql://exonit@localhost:5432/exonit")
+    "EXONIT_DATABASE_URL", "postgresql://exonit@<postgres-host>:5432/exonit")
 
 # Commit to PG every this many rows (avoids very large transactions).
 BATCH_SIZE = 500
@@ -99,6 +99,23 @@ CAND_COLS = (
     "triceratops_prob_planet", "exominer_score", "exominer_ffi_score",
     "exominer_tce_period", "exominer_sector_run", "claude_verdict",
 )
+
+# FPP-model gate columns (exonit.verdict_io.GATE_FIELDS): without them predict_verdict cannot
+# tell that a row carries a new-model FPP and would feed it to the classifiers. Selected only
+# when the DDL has been applied (a DB without them has only legacy-model rows).
+GATE_COLS = ("fpp_model_version", "triceratops_fpp_v1", "triceratops_nfpp_v1")
+
+
+def _cand_cols(cur) -> tuple:
+    """CAND_COLS plus the gate columns that exist on ``candidates`` (one catalog query)."""
+    # table_schema filter: a same-named table in another schema (a test schema, a replica)
+    # must not make us select columns the real `candidates` does not have.
+    cur.execute("SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = 'candidates' "
+                "AND column_name = ANY(%s)", (list(GATE_COLS),))
+    have = {r[0] for r in cur.fetchall()}
+    return CAND_COLS + tuple(c for c in GATE_COLS if c in have)
+
 
 # Columns to SELECT from stars — mirrors server._run_verdict_background exactly.
 STAR_COLS = (
@@ -134,20 +151,21 @@ def _fetch_candidates(dsn: str, sector: int,
 
     tic_ids = [p[0] for p in pairs]
     cnums = [p[1] for p in pairs]
-    cols_sql = ", ".join(f"c.{c}" for c in CAND_COLS)
-    query = f"""
+    result: dict[tuple[str, int], dict] = {}
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cols = _cand_cols(cur)
+            cols_sql = ", ".join(f"c.{c}" for c in cols)
+            query = f"""
         SELECT {cols_sql}
         FROM candidates c
         JOIN unnest(%s::text[], %s::bigint[]) AS t(tic_id, candidate_num)
           ON c.tic_id = t.tic_id AND c.candidate_num = t.candidate_num
         WHERE c.sector = %s
     """
-    result: dict[tuple[str, int], dict] = {}
-    with psycopg.connect(dsn) as conn:
-        with conn.cursor() as cur:
             cur.execute(query, (tic_ids, cnums, sector))
             for row in cur.fetchall():
-                d = dict(zip(CAND_COLS, row))
+                d = dict(zip(cols, row))
                 key = (str(d["tic_id"]), int(d["candidate_num"]))
                 result[key] = d
     return result
@@ -478,9 +496,10 @@ def run_parity_check(args) -> int:
     logger.info("=== Parity check: sector %d, N=%d ===", sector, n_check)
 
     # Fetch N candidates ordered by cnn_score desc (prefer confident rows).
-    cols_sql = ", ".join(f"c.{c}" for c in CAND_COLS)
     with psycopg.connect(args.db) as conn:
         with conn.cursor() as cur:
+            cols = _cand_cols(cur)
+            cols_sql = ", ".join(f"c.{c}" for c in cols)
             cur.execute(f"""
                 SELECT {cols_sql}
                 FROM candidates c
@@ -495,7 +514,7 @@ def run_parity_check(args) -> int:
         logger.error("No candidates found for sector %d", sector)
         return 1
 
-    cand_rows = [dict(zip(CAND_COLS, r)) for r in rows]
+    cand_rows = [dict(zip(cols, r)) for r in rows]
     tic_ids = list({str(r["tic_id"]) for r in cand_rows})
     star_map = _fetch_stars(args.db, tic_ids)
     exptime_map = _load_exptime_map(tic_ids)

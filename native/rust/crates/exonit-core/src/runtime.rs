@@ -161,6 +161,12 @@ impl WorkerRuntimeState {
         state.stars_done += 1;
         state.last_error = None;
     }
+    pub fn released(&self) {
+        let mut state = self.lock();
+        state.current_tic = None;
+        state.phase = None;
+        state.last_error = None;
+    }
     pub fn failed(&self, message: String) {
         let mut state = self.lock();
         state.current_tic = None;
@@ -696,7 +702,10 @@ impl WorkerRuntime {
                     models_dir,
                     max_concurrency,
                     config.gpu_enabled,
-                );
+                )
+                .with_gap_fill_detrend_only(config.gap_fill_detrend_only)
+                .with_harmonic_epoch_class(config.harmonic_epoch_class)
+                .with_ffi_fallback(config.ffi_fallback_on_load_fail, config.ffi_fetch_timeout);
                 let cnn_available = primary.cnn_available();
                 let exominer_available = primary.exominer_available();
                 // F4a: honest now — `gpu_used()` reflects whether
@@ -1108,6 +1117,8 @@ fn process_one_fpp(
         );
         req.nfpp = Some(-1.0);
         req.verdict = Some("failed".to_string());
+        // every -1 post carries skip_reason (null: there is no typed reason here)
+        req.skip_reason = Some(None);
         shared
             .result_outbox
             .enqueue_fpp(&req, worker_id, crate::outbox::now_unix())
@@ -1118,6 +1129,14 @@ fn process_one_fpp(
             .failed("fpp_backfill configured but processor has no FPP support".to_string());
         return Ok(ProcessOutcome::DidWork);
     };
+    if let Some(release) = &outcome.release {
+        shared
+            .api
+            .release_fpp_task(release, worker_id)
+            .map_err(api_error)?;
+        shared.state.released();
+        return Ok(ProcessOutcome::DidWork);
+    }
     shared
         .result_outbox
         .enqueue_fpp(&outcome.request, worker_id, crate::outbox::now_unix())
@@ -1187,7 +1206,7 @@ fn heartbeat_loop(shared: Arc<RuntimeShared>) {
             uptime_seconds: shared.started.elapsed().as_secs_f64(),
             pid: std::process::id() as i32,
             git_sha: None,
-            flag_states: Map::new(),
+            flag_states: current_flag_states(&shared),
             gpu_fallback: Map::new(),
             system: telemetry.sample().to_json_map(),
             gpu_telemetry: Map::new(),
@@ -1221,4 +1240,282 @@ fn interruptible_sleep(total: Duration, state: &WorkerRuntimeState) {
 
 fn api_error(error: WorkerApiError) -> WorkerRuntimeError {
     WorkerRuntimeError::Api(error.to_string())
+}
+
+/// Worker-config feature flags published in every heartbeat (python
+/// `_resolve_flag_states`); keep it small.
+pub fn heartbeat_flag_states(config: &WorkerConfig) -> Map<String, Value> {
+    heartbeat_flag_states_with(config, None)
+}
+
+/// [`heartbeat_flag_states`] plus `harmonic_epoch_class`, which the server
+/// dispatches per task (task value > local config > off): python reports the
+/// value the last task ACTUALLY ran with, never the local config, and omits
+/// the key until the first task has started (`effective` = `None`).
+pub fn heartbeat_flag_states_with(config: &WorkerConfig, effective_harmonic_epoch_class: Option<bool>) -> Map<String, Value> {
+    let mut flags = Map::new();
+    flags.insert("gap_fill_detrend_only".to_string(), Value::Bool(config.gap_fill_detrend_only));
+    flags.insert("ffi_fallback_on_load_fail".to_string(), Value::Bool(config.ffi_fallback_on_load_fail));
+    if let Some(effective) = effective_harmonic_epoch_class {
+        flags.insert("harmonic_epoch_class".to_string(), Value::Bool(effective));
+    }
+    flags
+}
+
+fn current_flag_states(shared: &RuntimeShared) -> Map<String, Value> {
+    heartbeat_flag_states_with(&shared.config, shared.processor.last_harmonic_epoch_class())
+}
+
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod fpp_release_runtime_support;
+
+#[cfg(test)]
+mod fpp_release_runtime_tests {
+    use super::*;
+    use crate::task_processor::{FppProcessOutcome, TaskProcessor};
+    use std::sync::Arc;
+
+    struct ReleaseProcessor;
+
+    impl TaskProcessor for ReleaseProcessor {
+        fn process(
+            &self,
+            _task: &crate::dto::WorkerTask,
+            _worker_id: &str,
+        ) -> crate::dto::PrimaryResultRequest {
+            unreachable!("FPP release test does not process primary tasks")
+        }
+
+        fn process_fpp(
+            &self,
+            task: &crate::dto::BackfillTask,
+            raw_task: &Map<String, Value>,
+            _worker_id: &str,
+        ) -> Option<FppProcessOutcome> {
+            let mut release = Map::new();
+            release.insert("candidate_id".into(), Value::from(task.candidate_id));
+            release.insert("claim_id".into(), raw_task["fpp_claim_id"].clone());
+            release.insert("tic_id".into(), Value::String(task.tic_id.clone()));
+            release.insert("reason".into(), Value::from("population_missing"));
+            Some(FppProcessOutcome {
+                request: crate::dto::FppResultRequest::new(
+                    Some(task.candidate_id),
+                    Some(task.tic_id.clone()),
+                    None,
+                ),
+                error: Some("population_missing".into()),
+                release: Some(release),
+            })
+        }
+    }
+
+    /// A processor whose FPP ends without a score for a typed skip reason (Python: `calc_fpp_native` returns None
+    /// with `last_skip_reason = "giant_host"`), mapped by the production `fpp_error_outcome`.
+    struct SkipProcessor;
+
+    impl TaskProcessor for SkipProcessor {
+        fn process(
+            &self,
+            _task: &crate::dto::WorkerTask,
+            _worker_id: &str,
+        ) -> crate::dto::PrimaryResultRequest {
+            unreachable!("FPP skip test does not process primary tasks")
+        }
+
+        fn process_fpp(
+            &self,
+            task: &crate::dto::BackfillTask,
+            raw_task: &Map<String, Value>,
+            _worker_id: &str,
+        ) -> Option<FppProcessOutcome> {
+            let mut req = crate::dto::FppResultRequest::new(Some(task.candidate_id), Some(task.tic_id.clone()), None);
+            req.candidate = Some(raw_task.clone());
+            Some(crate::task_processor::fpp_error_outcome(
+                task,
+                raw_task,
+                req,
+                crate::fpp::FppError::skip(crate::fpp::FppSkipReason::GiantHost, "missing target stellar parameters"),
+            ))
+        }
+    }
+
+    /// Task 33 item 3.5: exactly one `/fpp_result` POST with `fpp = -1`, `verdict = "failed"` and the typed
+    /// `skip_reason`, no release, and an empty queue afterwards.
+    #[test]
+    fn runtime_posts_one_failed_result_with_the_skip_reason_and_no_release() {
+        use super::fpp_release_runtime_support::{MockRequest, MockResponse, MockServer};
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let (captured, captured_bodies) = (calls.clone(), bodies.clone());
+        let server = MockServer::start(move |request: &MockRequest| {
+            captured.lock().unwrap().push(request.path.clone());
+            match request.path.as_str() {
+                "/api/worker/fpp_task" => MockResponse::json(
+                    200,
+                    r#"{"task":{"candidate_id":89,"tic_id":"54321","candidate_num":1,"period_days":3.0,"t0":2459000.0,"duration_days":0.1,"depth_ppm":500.0,"snr":10.0,"fpp_claim_id":"claim-89"}}"#,
+                ),
+                "/api/worker/fpp_result" => {
+                    captured_bodies.lock().unwrap().push(request.body_json());
+                    MockResponse::json(200, r#"{"status":"ok"}"#)
+                }
+                "/api/worker/fpp_release" => panic!("a failed FPP must never be released: {}", request.body_json()),
+                other => panic!("unexpected runtime request {other}"),
+            }
+        });
+        let directory = std::env::temp_dir().join(format!(
+            "exonit-rust-fpp-skip-runtime-{}-{:x}",
+            std::process::id(),
+            crate::outbox::now_unix().to_bits()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let config = WorkerConfig::new(server.base_url.clone(), "test-token", "fpp-skip-test")
+            .validated()
+            .unwrap();
+        let runtime = WorkerRuntime::with_processor(
+            config,
+            &directory.join("outbox.sqlite"),
+            true,
+            None,
+            Arc::new(SkipProcessor),
+        )
+        .unwrap();
+        assert!(matches!(process_one_fpp(&runtime.shared, "wid").unwrap(), ProcessOutcome::DidWork));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["/api/worker/fpp_task".to_string(), "/api/worker/fpp_result".to_string()]
+        );
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        let b = &bodies[0];
+        assert_eq!(b["fpp"], -1.0);
+        assert_eq!(b["nfpp"], -1.0);
+        assert_eq!(b["verdict"], "failed");
+        assert_eq!(b["skip_reason"], "giant_host");
+        assert_eq!(b["candidate_id"], 89);
+        assert!(b.get("fpp_mc_se").is_none() && b.get("fpp_platform").is_none(), "no model fields on a -1 post");
+        assert_eq!(
+            runtime
+                .shared
+                .durable_outbox
+                .pending(crate::outbox::now_unix(), 10)
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn runtime_releases_unavailable_fpp_without_enqueuing_a_score() {
+        use super::fpp_release_runtime_support::{MockRequest, MockResponse, MockServer};
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured = calls.clone();
+        let server = MockServer::start(move |request: &MockRequest| {
+            captured.lock().unwrap().push(request.path.clone());
+            match request.path.as_str() {
+                "/api/worker/fpp_task" => MockResponse::json(
+                    200,
+                    r#"{"task":{"candidate_id":88,"tic_id":"12345","candidate_num":1,"period_days":3.0,"t0":2459000.0,"duration_days":0.1,"depth_ppm":500.0,"snr":10.0,"fpp_claim_id":"claim-88"}}"#,
+                ),
+                "/api/worker/fpp_release" => {
+                    let body = request.body_json();
+                    assert_eq!(body["candidate_id"], 88);
+                    assert_eq!(body["claim_id"], "claim-88");
+                    assert_eq!(body["tic_id"], "12345");
+                    assert_eq!(body["reason"], "population_missing");
+                    MockResponse::json(200, r#"{"status":"released"}"#)
+                }
+                "/api/worker/fpp_result" => {
+                    panic!("unavailable FPP must never post a score: {}", request.body_json())
+                }
+                other => panic!("unexpected runtime request {other}"),
+            }
+        });
+        let directory = std::env::temp_dir().join(format!(
+            "exonit-rust-fpp-release-runtime-{}-{:x}",
+            std::process::id(),
+            crate::outbox::now_unix().to_bits()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let config = WorkerConfig::new(server.base_url.clone(), "test-token", "fpp-release-test")
+            .validated()
+            .unwrap();
+        let runtime = WorkerRuntime::with_processor(
+            config,
+            &directory.join("outbox.sqlite"),
+            true,
+            None,
+            Arc::new(ReleaseProcessor),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            process_one_fpp(&runtime.shared, "wid").unwrap(),
+            ProcessOutcome::DidWork
+        ));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                "/api/worker/fpp_task".to_string(),
+                "/api/worker/fpp_release".to_string()
+            ]
+        );
+        assert_eq!(runtime.shared.state.stars_done(), 0);
+        assert_eq!(runtime.shared.state.current_tic(), None);
+        assert_eq!(
+            runtime
+                .shared
+                .durable_outbox
+                .pending(crate::outbox::now_unix(), 10)
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    /// Heartbeat `flag_states.harmonic_epoch_class` is the EFFECTIVE value of
+    /// the last task (python `_resolve_flag_states`), never the worker config,
+    /// and absent until a task has run.
+    #[test]
+    fn heartbeat_publishes_the_effective_epoch_class_not_the_config() {
+        struct Fixed(Option<bool>);
+        impl TaskProcessor for Fixed {
+            fn process(&self, _t: &crate::dto::WorkerTask, _w: &str) -> crate::dto::PrimaryResultRequest {
+                unreachable!("not processing in this test")
+            }
+            fn last_harmonic_epoch_class(&self) -> Option<bool> {
+                self.0
+            }
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "exonit-rust-hb-flag-{}-{:x}",
+            std::process::id(),
+            crate::outbox::now_unix().to_bits()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        for (config_flag, effective, expected) in [
+            (false, Some(true), Some(true)), // server ON over local OFF
+            (true, Some(false), Some(false)), // server OFF over local ON
+            (true, None, None),               // no task yet: absent even if the config says ON
+        ] {
+            let mut config = WorkerConfig::new("http://127.0.0.1:1", "t", "hb-test").validated().unwrap();
+            config.harmonic_epoch_class = config_flag;
+            let runtime = WorkerRuntime::with_processor(
+                config,
+                &directory.join(format!("outbox-{config_flag}-{effective:?}.sqlite")),
+                false,
+                None,
+                Arc::new(Fixed(effective)),
+            )
+            .unwrap();
+            let flags = super::current_flag_states(&runtime.shared);
+            assert_eq!(
+                flags.get("harmonic_epoch_class").and_then(|v| v.as_bool()),
+                expected,
+                "config {config_flag} effective {effective:?}"
+            );
+        }
+    }
 }

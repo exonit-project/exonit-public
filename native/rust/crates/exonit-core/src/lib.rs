@@ -25,6 +25,7 @@ pub mod preprocess;
 
 // F2 — BLS CPU + vetting (vegeu docs/PLAN.md)
 pub mod bls;
+pub mod harmonic_epoch_class;
 pub mod harmonic_resolver;
 pub mod long_period_sweep;
 pub mod multi_planet;

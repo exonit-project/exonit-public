@@ -75,7 +75,7 @@ def _load_canonical(csv_path: str) -> list:
 def _load_downloaded_set(tglc_index_path: str, sector: int | None = None) -> set:
     """Return the set of int TIC ids present in the TGLC index (sector-scoped).
 
-    Phase 2 fix (2026-08-27): routed through MetadataCache — the
+    Fase 2 fix (2026-08-27): routed through MetadataCache — the
     metadata_backend seam — exactly like ``load_extended_canonical`` (spec
     2026-07-20-tglc-index-to-pg, D3 item e). The old raw ``sqlite3.connect``
     read the FROZEN ``data/metadata_cache.db``, which holds nothing indexed
@@ -221,7 +221,7 @@ def _finish_survey_enqueue(
 ) -> int:
     """Shared tail of the survey (non-deep) enqueue path (steps 6-9):
     write the lot CSV, run enqueue_from_csv.py, parse its summary, compute
-    the S4 effective lot size + "no TIC lost" rule, and — only on
+    the S4 effective lot size + "cap TIC perdut" rule, and — only on
     success — call *advance_cursor_fn* (which persists whatever cursor
     fields this lot's selector uses) before appending to CAMPAIGN.md and
     emitting the final plan.
@@ -297,7 +297,7 @@ def _finish_survey_enqueue(
     plan["enqueued"] = effective
 
     if enq_failed > 0:
-        # "No TIC lost" rule (S4 §2.1, operator decision §9.3): a chunk
+        # "Cap TIC perdut" rule (S4 §2.1, the owner's decision §9.3): a chunk
         # lost despite Q5's retries must never silently advance the cursor
         # past it — a re-run of this SAME lot (cursor untouched) adopts the
         # tasks already created (S4) and retries the rest.
@@ -335,8 +335,8 @@ def _finish_survey_enqueue(
             "enqueue_skipped": plan.get("enqueue_skipped"),
             "enqueue_failed": plan.get("enqueue_failed"),
             "detail": (
-                "all selected TICs are already analysed (stars) "
-                "or have no FITS; no task created"
+                "tots els TICs seleccionats ja consten analitzats (stars) "
+                "o sense FITS; cap task creada"
             ),
         })
         return 2
@@ -554,7 +554,7 @@ def main(argv=None):
         plan["enqueued"] = effective
 
         if enq_failed > 0:
-            # "No TIC lost" rule (S4 §2.1): a chunk lost despite Q5's
+            # "Cap TIC perdut" rule (S4 §2.1): a chunk lost despite Q5's
             # retries must never silently advance the cursor past it — a
             # re-run of this SAME plan (deep_cursor untouched) adopts the
             # tasks already created (S4) and retries the rest.

@@ -7,15 +7,8 @@ import Foundation
 /// explicit: the FPP goldens compare IEEE-754 `Double` bit patterns.
 public enum FPPTransit {
     public static func keplerEquation(meanAnomaly m: Double, eccentricity ecc: Double) -> Double {
-        let tolerance = 1e-10
-        var eccentricAnomaly = m
-        for _ in 0..<30 {
-            let delta = (eccentricAnomaly - ecc * sin(eccentricAnomaly) - m)
-                / (1.0 - ecc * cos(eccentricAnomaly))
-            eccentricAnomaly -= delta
-            if abs(delta) < tolerance { break }
-        }
-        return eccentricAnomaly
+        let solved = FPPV2Orbit.keplerSolve(m, ecc)
+        return solved.converged ? solved.eccentricAnomaly : .nan
     }
 
     public static func trueAnomaly(meanAnomaly m: Double, eccentricity ecc: Double) -> Double {

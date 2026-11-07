@@ -1,8 +1,8 @@
-"""Shared types of the autonomy subsystem (phase 1 — shadow mode).
+"""Shared types of the autonomy subsystem (phase 1 -- shadow mode).
 
-All types are simple `@dataclass`es with `to_dict()`/`from_dict()`
-based on `dataclasses.asdict` to ease JSON serialization in the shadow
-logs and email reports.
+All types are plain `@dataclass`es with `to_dict()`/`from_dict()`
+based on `dataclasses.asdict` to ease JSON serialisation in the shadow
+logs and the e-mail reports.
 """
 
 from dataclasses import dataclass, field, asdict

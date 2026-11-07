@@ -1,4 +1,4 @@
-"""Discovery campaign endpoints: sectors/gap-stats/downloads/scan/autofill (Phase D split).
+"""Discovery campaign endpoints: sectors/gap-stats/downloads/scan/autofill (Fase D split).
 
 Extracted verbatim from exonit.server.create_app() — see
 docs/reviews/2026-07-02-opus48-cleanup-review.md and
@@ -51,7 +51,7 @@ from exonit.shared_state import get_shared_state
 def _lot_stamp_from_csv(lot_csv: str) -> str:
     """Lot identifier for run_id minting, from the lot CSV basename.
 
-    Phase 3 Task 2 (durable orchestration): MUST match
+    Fase 3 Task 2 (durable orchestration): MUST match
     scripts/discovery_orchestrator.py's ``_lot_number_from_csv`` EXACTLY —
     naming compatibility with existing scorecards/dossiers is a hard
     requirement. Deliberately duplicated rather than imported: ``scripts/``
@@ -316,7 +316,7 @@ def register(app, deps: ServerDeps) -> None:
         force-refresh / stale-TTL pass must never re-scan sectors nobody
         asked for). A sector whose ``_sector_gap_stats_ttl`` is ``None``
         (closed, no running autofill) is skipped even when explicitly listed
-        in *only_sectors* — "closed/complete without autofill: never" (spec
+        in *only_sectors* — "tancats/complets sense autofill: mai" (spec
         §5.2) is absolute, not just a cadence default.
 
         Legacy path (``EXONIT_GAP_STATS_V2`` off, or SQLite): pulls the
@@ -1399,12 +1399,12 @@ def register(app, deps: ServerDeps) -> None:
                 except Exception:
                     work_list_size = 0
 
-                # 'examined' = persistent registry cursor (sectors.json).
-                # It survives a DB reset and reflects the sector's progress
+                # 'examined' = cursor persistent del registry (sectors.json).
+                # Survives a DB reset and reflects the sector's progress
                 # accumulated across all runs, not the current run's tasks.
                 # Key advantage: on AWS the DB is wiped between runs but the
-                # registry cursor persists → progress is not lost.
-                # At home, cursor ≈ COUNT(completed) (difference <0.5%, verified).
+                # registry cursor persists -> progress is not lost.
+                # At home, cursor ~ COUNT(completed) (difference <0.5%, verified).
                 examined = cursor
 
                 # Per-sector gap metric, read from the background store
@@ -1588,7 +1588,7 @@ def register(app, deps: ServerDeps) -> None:
             run_id: str, detail: str = "orchestrator_spawn_failed") -> None:
         """Best-effort: flip a run to FAILED in PG and the JSON mirror.
 
-        Phase 3 Task 4: the single choke point used whenever a Popen for
+        Fase 3 Task 4: the single choke point used whenever a Popen for
         discovery_orchestrator.py raises, or spawns but never confirms (see
         _confirm_orchestrator_started) — the 2026-06-30 orphan-run incident
         this task fixes. Previously a Popen failure only logged a warning and
@@ -1633,7 +1633,7 @@ def register(app, deps: ServerDeps) -> None:
     async def _confirm_orchestrator_started(run_id: str, stale_states: set) -> bool:
         """Poll discovery_runs.state until it leaves *stale_states*, or time out.
 
-        Phase 3 Task 4: after a "successful" Popen, the process could still be
+        Fase 3 Task 4: after a "successful" Popen, the process could still be
         DOA (broken argv, import error, PG unreachable at ITS startup) and
         look identical to a healthy launch from the caller's side — Popen
         only reports whether the OS could exec the interpreter, not whether
@@ -1945,7 +1945,7 @@ def register(app, deps: ServerDeps) -> None:
                 # and is born already "done": the 100k lot of 2026-07-26 opened
                 # at "200,049 of 299,944", the figures of the 300k before it,
                 # and its header, bar, ETA and time-remaining stayed wrong for
-                # the whole run. the operator had to press "Reset stats" by hand after
+                # the whole run. the owner had to press "Reset stats" by hand after
                 # every launch — and this endpoint is THE way runs are started,
                 # by the UI button and by the chained-lot runner alike.
                 # Placed here, after the enqueue has committed: the next
@@ -1954,8 +1954,8 @@ def register(app, deps: ServerDeps) -> None:
                 try:
                     _server.reset_progress_baselines()
                 except Exception:
-                    logger.warning("scan: could not reset the "
-                                   "progress baselines", exc_info=True)
+                    logger.warning("scan: no s'han pogut resetejar els "
+                                   "baselines de progrés", exc_info=True)
                 # Bust the health_work cache (10 s TTL) so the orchestrator's
                 # FIRST SCANNING poll sees the just-committed tasks, not a stale
                 # pre-enqueue pending=0 snapshot. Without this the orchestrator
@@ -1989,7 +1989,7 @@ def register(app, deps: ServerDeps) -> None:
                     _log_fd, _log_path = _tempfile.mkstemp(
                         prefix="discovery_orch_", suffix=".log")
                     os.close(_log_fd)
-                    # Phase 3 Task 2 (durable orchestration): mint run_id ONCE,
+                    # Fase 3 Task 2 (durable orchestration): mint run_id ONCE,
                     # here, and create its discovery_runs PG row before
                     # spawning the orchestrator — which receives it via
                     # --run-id and must NEVER re-derive it (that
@@ -2075,7 +2075,7 @@ def register(app, deps: ServerDeps) -> None:
                                 cwd=str(_PROJECT_ROOT),
                             )
                     except Exception as _exc:
-                        # Phase 3 Task 4 (2026-06-30 orphan-run incident): a
+                        # Fase 3 Task 4 (2026-06-30 orphan-run incident): a
                         # Popen failure used to just log a warning and fall
                         # through to the 200 below, leaving discovery_runs
                         # (and the JSON mirror) stuck ENQUEUEING forever with
@@ -2093,7 +2093,7 @@ def register(app, deps: ServerDeps) -> None:
                     raw_json["orchestrator_pid"] = _proc.pid
                     raw_json["run_id"] = run_id
 
-                    # Phase 3 Task 4: record the pid in PG (the JSON mirror
+                    # Fase 3 Task 4: record the pid in PG (the JSON mirror
                     # only gets it from the orchestrator's OWN first
                     # _set_state call — a gap that would leave discovery_runs
                     # .orchestrator_pid NULL forever, silently defeating both
@@ -2108,7 +2108,7 @@ def register(app, deps: ServerDeps) -> None:
                             "could not record orchestrator_pid for "
                             "run_id=%s (non-fatal): %s", run_id, _exc)
 
-                    # Phase 3 Task 4: confirm the orchestrator actually took
+                    # Fase 3 Task 4: confirm the orchestrator actually took
                     # over (moved off ENQUEUEING) before reporting success —
                     # see _confirm_orchestrator_started's docstring.
                     confirmed = await _confirm_orchestrator_started(
@@ -2141,12 +2141,11 @@ def register(app, deps: ServerDeps) -> None:
     async def api_discovery_resume(request: Request):
         """Manually re-spawn the orchestrator for a stalled/dead run.
 
-        Phase 3 Task 4: the operator-facing recovery action for a run the
+        Fase 3 Task 4: the operator-facing recovery action for a run the
         dead-run watchdog (or the scan endpoint's own spawn confirmation)
         marked FAILED — or one that is still non-terminal but whose
         orchestrator process is confirmed dead. Deliberately never invoked
-        automatically: the operator decides when to resume (operator rule:
-        the operator launches the discovery runs).
+        automatically: the owner decides when to resume (CLAUDE.md "the owner launches discovery runs").
 
         Body: optional ``{"run_id": "..."}``. Without it, the candidate is
         the single active (non-terminal) discovery_runs row if one exists,
@@ -2255,7 +2254,7 @@ def register(app, deps: ServerDeps) -> None:
         _reap_in_background(_proc)
         _discovery_orchestrator["started_at"] = _time.time()
 
-        # Phase 3 Task 4: record the new pid in PG — same rationale as the
+        # Fase 3 Task 4: record the new pid in PG — same rationale as the
         # scan endpoint's identical write (see its comment): otherwise a
         # resumed run's orchestrator_pid would keep pointing at the OLD
         # (dead) process forever, breaking both the watchdog and a second
@@ -3179,14 +3178,14 @@ def register(app, deps: ServerDeps) -> None:
         daemon=True,
     ).start()
 
-    # --- Dead-run watchdog (Phase 3 Task 4) -------------------------------
+    # --- Dead-run watchdog (Fase 3 Task 4) -------------------------------
     # Detects an orchestrator that died mid-run without ever reaching a
     # terminal state (SIGKILL/OOM/host reboot) and marks the discovery_runs
     # row FAILED so a human can `POST /api/discovery/resume` it. This is the
     # "died mid-flight" counterpart to the scan endpoint's own spawn
     # confirmation above, which only covers "never started in the first
-    # place". Deliberately NEVER auto-resumes — the operator decides when (see
-    # the operator rule: the operator launches the discovery runs); the resume is a
+    # place". Deliberately NEVER auto-resumes — the owner decides when (see
+    # CLAUDE.md "the owner launches discovery runs"); the resume is a
     # separate, explicit 1-click/1-command action.
     #
     # Registered the same way every other background task in this file is

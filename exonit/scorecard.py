@@ -250,7 +250,7 @@ def load_db_processed_for_toi(db_path, toi_tics):
     scorecard reads completeness coverage from the dedicated SQLite
     completeness DB elsewhere).
 
-    Phase 4a Task 4 (``EXONIT_COMPLETENESS_PG=1``): completeness has moved off
+    Fase 4a Task 4 (``EXONIT_COMPLETENESS_PG=1``): completeness has moved off
     that SQLite sidecar into PG staging + bucketed Parquet aggregates.
     ``count_completeness_tics()`` (T1) is the exact count in that mode, but it
     lives on ``ExoNitDB`` (needs ``self._cmpl_pg``/``self.backend``) rather
@@ -294,7 +294,7 @@ def load_db_processed_for_toi(db_path, toi_tics):
                 _row_values(agg))
             if is_pg:
                 if completeness_pg_enabled():
-                    # Phase 4a Task 4: exact PG-backed count via T1's
+                    # Fase 4a Task 4: exact PG-backed count via T1's
                     # count_completeness_tics(), on its own short-lived
                     # ExoNitDB (see the docstring above for why it can't
                     # reuse the raw `backend`/`con` this loader already
@@ -762,12 +762,12 @@ def scorecard_to_markdown(card):
         "",
         *lot_lines,
         "",
-        "## Cumulative recall (whole DB — NOT the result of this run)",
+        "## Cumulative recall (whole DB — NOT this run's result)",
         "",
         f"- recall (cumulative) = {cum_recall} "
         f"({cum['n_detected']}/{cum['n_kp_cp']} KP/CP ever processed)",
         "",
-        "Global catalogue health. It moves ~1 detection per 400k-star run: "
+        "Overall catalogue health. It moves ~1 detection per 400k-star run: "
         "it is not useful for judging any pipeline change.",
         "",
         "## Recall by Depth (ppm) — cumulative",

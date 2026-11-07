@@ -298,6 +298,11 @@ pub struct PrimaryResultRequest {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Provenance: the effective alias phase-2 flag this result was computed
+    /// with (python result key `harmonic_epoch_class`; set on completed
+    /// results only, `None` = key absent, as in python's load_failed result).
+    #[serde(rename = "harmonic_epoch_class", default, skip_serializing_if = "Option::is_none")]
+    pub harmonic_epoch_class: Option<bool>,
 }
 
 impl PrimaryResultRequest {
@@ -323,6 +328,7 @@ impl PrimaryResultRequest {
             light_curve_load_recovered: false,
             status: "completed".to_string(),
             error: None,
+            harmonic_epoch_class: None,
         }
     }
 }
@@ -356,17 +362,49 @@ pub struct BackfillTask {
     /// Swift: `decodeIfPresent(Int.self, forKey: .sectorCount) ?? 1`.
     #[serde(rename = "n_sectors", default = "default_sector_count")]
     pub sector_count: i64,
+    /// Immutable server-shipped stellar population and its digest.
+    #[serde(default)]
+    pub population: Option<Value>,
+    #[serde(default)]
+    pub population_sha256: Option<String>,
+    #[serde(default)]
+    pub population_version: Option<String>,
+    /// Cross-check metadata is separate from the hashed document.
+    #[serde(default)]
+    pub population_crosscheck: Option<Value>,
+    #[serde(default)]
+    pub cadence_s: Option<f64>,
+    #[serde(default)]
+    pub geometry: Option<Value>,
+    #[serde(default)]
+    pub lc_source: Option<String>,
+    #[serde(default)]
+    pub tglc_near_edge: Option<bool>,
 }
 
 fn default_sector_count() -> i64 {
     1
 }
 
+fn deserialize_nullable_string<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
+fn deserialize_nullable_bool<'de, D>(deserializer: D) -> Result<Option<Option<bool>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<bool>::deserialize(deserializer).map(Some)
+}
+
 // ---------------------------------------------------------------------------
 // FPP / ExoMiner result payloads
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FppResultRequest {
     #[serde(rename = "candidate_id", default, skip_serializing_if = "Option::is_none")]
     pub candidate_id: Option<i64>,
@@ -382,6 +420,165 @@ pub struct FppResultRequest {
     pub verdict: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate: Option<Map<String, Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fpp_scen: Option<Map<String, Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fpp_flags: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fpp_model_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dilution_convention: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aperture_source: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth_scale: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub population_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub population_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub population_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub population_generator: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub population_mapping_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_comp: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_comp_fainter: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kepler_unconverged_draws: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dilution_corrected: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dilution_unverified: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dilution_alternatives: Option<Map<String, Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lc_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fpp_backend: Option<String>,
+    /// Platform of the computing binary, `<os>-<arch>` (plan (t) 2 provenance).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fpp_platform: Option<String>,
+    /// C math library identity and version, e.g. `glibc-2.43`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fpp_libm: Option<String>,
+    /// `debug` or `release` build of the computing binary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fpp_build_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fpp_seed: Option<u64>,
+    // ---- step 7 (decision C) Monte-Carlo noise fields, `worker._fpp_result_model_fields` (task 26 / 33)
+    /// MC standard error of the reported FPP; omitted when non-finite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fpp_mc_se: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nfpp_mc_se: Option<f64>,
+    /// Draws per scenario of the reported stage (`n_draws_final`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fpp_n_draws: Option<u64>,
+    /// Draws per scenario summed over the stages run (`n_draws_total`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fpp_n_draws_total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mc_min_ess: Option<f64>,
+    /// Present only when the MC policy ran (`mc_policy`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mc_borderline: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mc_detail: Option<Value>,
+    /// WHY a `-1` / `failed` result has no score (Python `calc_fpp_by_source.last_skip_reason`); `Some(None)`
+    /// posts an explicit JSON `null`, as the Python worker does. Never on a computed result.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_nullable_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub skip_reason: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fpp_switches: Option<Map<String, Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high_crowding: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gal_b: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_nearby: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trilegal_used: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry_model_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry_coverage: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry_n_sectors: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry_n_task_sectors: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry_source: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry_path: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry_path_emulated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry_n_epochs: Option<Vec<usize>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry_sigma_cal: Option<Vec<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_nodes: Option<usize>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_nullable_bool",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tglc_near_edge: Option<Option<bool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_viable_neighbours: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_viability_weighted: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viability_mass_skipped: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fluxratio_target: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sigma_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sigma_fit_ill_conditioned: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposure_unconverged: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposure_unconverged_share: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposure_gl_fallback_share: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cadence_s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tglc_near_edge_unknown: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub population_crosscheck_status: Option<String>,
+    // ---- ephemeris refinement provenance fields (section 8b, FPP_EPHEM_REFINE)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephem_refined: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephem_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephem_t0_convention: Option<String>,
+    #[serde(rename = "ephem_P", default, skip_serializing_if = "Option::is_none")]
+    pub ephem_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephem_t0: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephem_shift_h: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephem_refine: Option<crate::fpp::ephem::RefineProvenanceFields>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephem_refine_failed: Option<bool>,
 }
 
 impl FppResultRequest {
@@ -394,6 +591,76 @@ impl FppResultRequest {
             probability_planet: None,
             verdict: None,
             candidate: None,
+            fpp_scen: None,
+            fpp_flags: None,
+            fpp_model_version: None,
+            geometry_version: None,
+            dilution_convention: None,
+            aperture_source: None,
+            depth_scale: None,
+            population_version: None,
+            population_source: None,
+            population_sha256: None,
+            population_generator: None,
+            population_mapping_version: None,
+            n_comp: None,
+            n_comp_fainter: None,
+            kepler_unconverged_draws: None,
+            dilution_corrected: None,
+            dilution_unverified: None,
+            dilution_alternatives: None,
+            lc_source: None,
+            fpp_backend: None,
+            fpp_platform: None,
+            fpp_libm: None,
+            fpp_build_profile: None,
+            fpp_seed: None,
+            fpp_mc_se: None,
+            nfpp_mc_se: None,
+            fpp_n_draws: None,
+            fpp_n_draws_total: None,
+            mc_min_ess: None,
+            mc_borderline: None,
+            mc_detail: None,
+            skip_reason: None,
+            fpp_switches: None,
+            high_crowding: None,
+            gal_b: None,
+            n_nearby: None,
+            trilegal_used: None,
+            geometry_model_version: None,
+            geometry_kind: None,
+            geometry_mode: None,
+            geometry_coverage: None,
+            geometry_n_sectors: None,
+            geometry_n_task_sectors: None,
+            geometry_source: None,
+            geometry_path: None,
+            geometry_path_emulated: None,
+            geometry_n_epochs: None,
+            geometry_sigma_cal: None,
+            n_nodes: None,
+            tglc_near_edge: None,
+            n_viable_neighbours: None,
+            n_viability_weighted: None,
+            viability_mass_skipped: None,
+            fluxratio_target: None,
+            sigma_source: None,
+            sigma_fit_ill_conditioned: None,
+            exposure_unconverged: None,
+            exposure_unconverged_share: None,
+            exposure_gl_fallback_share: None,
+            cadence_s: None,
+            tglc_near_edge_unknown: None,
+            population_crosscheck_status: None,
+            ephem_refined: None,
+            ephem_status: None,
+            ephem_t0_convention: None,
+            ephem_p: None,
+            ephem_t0: None,
+            ephem_shift_h: None,
+            ephem_refine: None,
+            ephem_refine_failed: None,
         }
     }
 }
@@ -596,8 +863,17 @@ pub struct WorkerTaskResponse {
     pub tic_id: Option<String>,
     #[serde(rename = "wait_seconds", default)]
     pub wait_seconds: Option<f64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_config_or_empty")]
     pub config: Map<String, Value>,
+}
+
+/// `config: null` (or absent) is an empty task config, like Swift's
+/// `decodeIfPresent(...) ?? [:]` and python's `task.get("config") or {}`.
+fn deserialize_config_or_empty<'de, D>(deserializer: D) -> Result<Map<String, Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<Map<String, Value>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -81,7 +81,7 @@ _PROGRESS_FIELD_TO_ENV = {
 }
 
 # Deployed alongside compact_completeness.py in the same repo checkout
-# (the service runs the whole repo checkout) — resolved relative
+# (<host> runs the whole repo at ~/exonit) — resolved relative
 # to THIS file, not the process cwd, so the service can be launched from
 # anywhere (systemd sets WorkingDirectory but this must not depend on it).
 _COMPACT_SCRIPT_DEFAULT = Path(__file__).resolve().parent / "compact_completeness.py"
